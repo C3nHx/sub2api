@@ -118,16 +118,19 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 
 	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
 
-	userReleaseFunc, err := h.concurrencyHelper.AcquireUserSlotWithWait(c, subject.UserID, subject.Concurrency, reqStream, &streamStarted)
+	admission, err := h.concurrencyHelper.Begin(c, UserAdmissionRequest{
+		UserID:         subject.UserID,
+		MaxConcurrency: subject.Concurrency,
+		Mode:           AdmissionModeWait,
+		Stream:         reqStream,
+		StreamStarted:  &streamStarted,
+	})
 	if err != nil {
 		reqLog.Warn("gateway.responses.user_slot_acquire_failed", zap.Error(err))
 		h.handleConcurrencyError(c, err, "user", streamStarted)
 		return
 	}
-	userReleaseFunc = wrapReleaseOnDone(c.Request.Context(), userReleaseFunc)
-	if userReleaseFunc != nil {
-		defer userReleaseFunc()
-	}
+	defer admission.Close()
 
 	// 2. Re-check billing
 	if err := h.billingCacheService.CheckBillingEligibility(requestCtx, apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(requestCtx, apiKey)); err != nil {
@@ -190,28 +193,20 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
 		// 4. Acquire account concurrency slot
-		accountReleaseFunc := selection.ReleaseFunc
-		if !selection.Acquired {
-			if selection.WaitPlan == nil {
+		if err := admission.AdmitAccount(AccountAdmissionRequest{
+			Selection:  selection,
+			WaitPolicy: AccountWaitPolicyUntracked,
+		}); err != nil {
+			var unavailableErr *AccountUnavailableError
+			if errors.As(err, &unavailableErr) {
 				markOpsRoutingCapacityLimited(c)
 				h.responsesErrorResponse(c, http.StatusServiceUnavailable, "api_error", "No available accounts")
 				return
 			}
-			accountReleaseFunc, err = h.concurrencyHelper.AcquireAccountSlotWithWaitTimeout(
-				c,
-				account.ID,
-				selection.WaitPlan.MaxConcurrency,
-				selection.WaitPlan.Timeout,
-				reqStream,
-				&streamStarted,
-			)
-			if err != nil {
-				reqLog.Warn("gateway.responses.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
-				h.handleConcurrencyError(c, err, "account", streamStarted)
-				return
-			}
+			reqLog.Warn("gateway.responses.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+			h.handleConcurrencyError(c, err, "account", streamStarted)
+			return
 		}
-		accountReleaseFunc = wrapReleaseOnDone(c.Request.Context(), accountReleaseFunc)
 
 		// 5. Forward request
 		writerSizeBeforeForward := c.Writer.Size()
@@ -221,9 +216,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		}
 		result, err := h.gatewayService.ForwardAsResponses(requestCtx, c, account, forwardBody, parsedReq)
 
-		if accountReleaseFunc != nil {
-			accountReleaseFunc()
-		}
+		admission.ReleaseAccount()
 
 		if err != nil {
 			var failoverErr *service.UpstreamFailoverError
