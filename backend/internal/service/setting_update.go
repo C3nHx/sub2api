@@ -14,6 +14,14 @@ import (
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 )
 
+var allowedExtraConcurrencyPlatforms = map[string]struct{}{
+	"anthropic":   {},
+	"openai":      {},
+	"gemini":      {},
+	"antigravity": {},
+	"grok":        {},
+}
+
 // UpdateSettings 更新系统设置
 func (s *SettingService) UpdateSettings(ctx context.Context, settings *SystemSettings) error {
 	updates, err := s.buildSystemSettingsUpdates(ctx, settings)
@@ -51,6 +59,10 @@ func (s *SettingService) UpdateSettingsWithAuthSourceDefaults(ctx context.Contex
 }
 
 func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, settings *SystemSettings) (map[string]string, error) {
+	applyLegacyExtraConcurrencyDefaults(settings)
+	if err := validateExtraConcurrencySettings(settings); err != nil {
+		return nil, err
+	}
 	if err := s.validateDefaultSubscriptionGroups(ctx, settings.DefaultSubscriptions); err != nil {
 		return nil, err
 	}
@@ -276,6 +288,20 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 
 	// 默认配置
 	updates[SettingKeyDefaultConcurrency] = strconv.Itoa(settings.DefaultConcurrency)
+	updates[SettingKeyDefaultExtraConcurrency] = strconv.Itoa(settings.DefaultExtraConcurrency)
+	updates[SettingKeyExtraConcurrencyEnabled] = strconv.FormatBool(settings.ExtraConcurrencyEnabled)
+	updates[SettingKeyExtraConcurrencyWaitTimeoutSeconds] = strconv.Itoa(settings.ExtraConcurrencyWaitTimeoutSeconds)
+	updates[SettingKeyExtraConcurrencyReservePercent] = strconv.FormatFloat(settings.ExtraConcurrencyReservePercent, 'f', -1, 64)
+	updates[SettingKeyExtraConcurrencyMinReservedSlots] = strconv.Itoa(settings.ExtraConcurrencyMinReservedSlots)
+	platformReserves := settings.ExtraConcurrencyPlatformReserves
+	if platformReserves == nil {
+		platformReserves = map[string]ExtraConcurrencyPlatformReserve{}
+	}
+	platformReservesJSON, err := json.Marshal(platformReserves)
+	if err != nil {
+		return nil, fmt.Errorf("marshal extra concurrency platform reserves: %w", err)
+	}
+	updates[SettingKeyExtraConcurrencyPlatformReserves] = string(platformReservesJSON)
 	updates[SettingKeyDefaultBalance] = strconv.FormatFloat(settings.DefaultBalance, 'f', 8, 64)
 	settings.AffiliateRebateRate = clampAffiliateRebateRate(settings.AffiliateRebateRate)
 	updates[SettingKeyAffiliateRebateRate] = strconv.FormatFloat(settings.AffiliateRebateRate, 'f', 8, 64)
@@ -417,6 +443,48 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	updates[SettingKeyAllowUserViewErrorRequests] = strconv.FormatBool(settings.AllowUserViewErrorRequests)
 
 	return updates, nil
+}
+
+func applyLegacyExtraConcurrencyDefaults(settings *SystemSettings) {
+	if settings == nil {
+		return
+	}
+	if settings.DefaultExtraConcurrency != 0 || settings.ExtraConcurrencyEnabled ||
+		settings.ExtraConcurrencyWaitTimeoutSeconds != 0 || settings.ExtraConcurrencyReservePercent != 0 ||
+		settings.ExtraConcurrencyMinReservedSlots != 0 || settings.ExtraConcurrencyPlatformReserves != nil {
+		return
+	}
+	settings.ExtraConcurrencyWaitTimeoutSeconds = 30
+	settings.ExtraConcurrencyReservePercent = 10
+	settings.ExtraConcurrencyMinReservedSlots = 1
+	settings.ExtraConcurrencyPlatformReserves = map[string]ExtraConcurrencyPlatformReserve{}
+}
+
+func validateExtraConcurrencySettings(settings *SystemSettings) error {
+	if settings.DefaultExtraConcurrency < 0 {
+		return infraerrors.BadRequest("INVALID_EXTRA_CONCURRENCY_SETTINGS", "default extra concurrency must be non-negative")
+	}
+	if settings.ExtraConcurrencyWaitTimeoutSeconds < 1 || settings.ExtraConcurrencyWaitTimeoutSeconds > 300 {
+		return infraerrors.BadRequest("INVALID_EXTRA_CONCURRENCY_SETTINGS", "extra concurrency wait timeout must be between 1 and 300 seconds")
+	}
+	if math.IsNaN(settings.ExtraConcurrencyReservePercent) || settings.ExtraConcurrencyReservePercent < 0 || settings.ExtraConcurrencyReservePercent > 100 {
+		return infraerrors.BadRequest("INVALID_EXTRA_CONCURRENCY_SETTINGS", "extra concurrency reserve percent must be between 0 and 100")
+	}
+	if settings.ExtraConcurrencyMinReservedSlots < 0 {
+		return infraerrors.BadRequest("INVALID_EXTRA_CONCURRENCY_SETTINGS", "extra concurrency minimum reserved slots must be non-negative")
+	}
+	for platform, reserve := range settings.ExtraConcurrencyPlatformReserves {
+		if _, ok := allowedExtraConcurrencyPlatforms[platform]; !ok {
+			return infraerrors.BadRequest("INVALID_EXTRA_CONCURRENCY_SETTINGS", "unknown extra concurrency platform: "+platform)
+		}
+		if reserve.ReservePercent != nil && (math.IsNaN(*reserve.ReservePercent) || *reserve.ReservePercent < 0 || *reserve.ReservePercent > 100) {
+			return infraerrors.BadRequest("INVALID_EXTRA_CONCURRENCY_SETTINGS", "extra concurrency reserve percent for "+platform+" must be between 0 and 100")
+		}
+		if reserve.MinReservedSlots != nil && *reserve.MinReservedSlots < 0 {
+			return infraerrors.BadRequest("INVALID_EXTRA_CONCURRENCY_SETTINGS", "extra concurrency minimum reserved slots for "+platform+" must be non-negative")
+		}
+	}
+	return nil
 }
 
 // validateDefaultPlatformQuotaMap 校验 platform quota map 的合法性：
@@ -574,6 +642,15 @@ func (s *SettingService) refreshCachedSettings(settings *SystemSettings) {
 	// codex_cli_only 加固策略缓存：设置更新后强制下次重载（涉及 4 个键 + JSON 解析，直接置过期）。
 	s.codexRestrictionPolicySF.Forget("codex_restriction_policy")
 	s.codexRestrictionPolicyCache.Store(&cachedCodexRestrictionPolicy{expiresAt: 0})
+	s.extraConcurrencyRuntimeSF.Forget(extraConcurrencyRuntimeCacheKey)
+	extraConcurrencyRuntime := cloneExtraConcurrencyRuntimeSettings(ExtraConcurrencyRuntimeSettings{
+		Enabled:            settings.ExtraConcurrencyEnabled,
+		WaitTimeoutSeconds: settings.ExtraConcurrencyWaitTimeoutSeconds,
+		ReservePercent:     settings.ExtraConcurrencyReservePercent,
+		MinReservedSlots:   settings.ExtraConcurrencyMinReservedSlots,
+		PlatformReserves:   settings.ExtraConcurrencyPlatformReserves,
+	})
+	s.extraConcurrencyRuntimeCache.Store(&extraConcurrencyRuntime)
 	if s.onUpdate != nil {
 		s.onUpdate() // Invalidate cache after settings update
 	}
