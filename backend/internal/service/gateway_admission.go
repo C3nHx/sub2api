@@ -37,6 +37,7 @@ type TargetLeaseRequest struct {
 	ReservedSlots    int
 	Class            AdmissionClass
 	WaitTimeout      time.Duration
+	Unlimited        bool
 }
 
 type TargetLeaseResult struct {

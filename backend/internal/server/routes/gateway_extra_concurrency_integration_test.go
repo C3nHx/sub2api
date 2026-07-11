@@ -118,6 +118,7 @@ type extraConcurrencySettingRepository struct {
 	waitTimeoutSeconds int
 	reservePercent     float64
 	minReservedSlots   int
+	disabled           bool
 }
 
 func (extraConcurrencySettingRepository) Get(context.Context, string) (*service.Setting, error) {
@@ -132,8 +133,12 @@ func (r extraConcurrencySettingRepository) GetMultiple(context.Context, []string
 	if waitTimeoutSeconds <= 0 {
 		waitTimeoutSeconds = 1
 	}
+	enabled := "true"
+	if r.disabled {
+		enabled = "false"
+	}
 	return map[string]string{
-		service.SettingKeyExtraConcurrencyEnabled:            "true",
+		service.SettingKeyExtraConcurrencyEnabled:            enabled,
 		service.SettingKeyExtraConcurrencyWaitTimeoutSeconds: strconv.Itoa(waitTimeoutSeconds),
 		service.SettingKeyExtraConcurrencyReservePercent:     strconv.FormatFloat(r.reservePercent, 'f', -1, 64),
 		service.SettingKeyExtraConcurrencyMinReservedSlots:   strconv.Itoa(r.minReservedSlots),
@@ -157,6 +162,266 @@ func (c extraConcurrencyCapacity) AdmissionCapacity(context.Context, string) (se
 		TotalConcurrency:   1,
 		AccountConcurrency: map[int64]int{c.accountID: 1},
 	}, nil
+}
+
+type openAIExtraConcurrencyAccountRepository struct {
+	service.AccountRepository
+	accounts []service.Account
+}
+
+func (r openAIExtraConcurrencyAccountRepository) GetByID(_ context.Context, id int64) (*service.Account, error) {
+	for i := range r.accounts {
+		if r.accounts[i].ID == id {
+			account := r.accounts[i]
+			return &account, nil
+		}
+	}
+	return nil, service.ErrNoAvailableAccounts
+}
+
+func (r openAIExtraConcurrencyAccountRepository) ListSchedulableByGroupIDAndPlatform(_ context.Context, groupID int64, platform string) ([]service.Account, error) {
+	return r.list(groupID, platform), nil
+}
+
+func (r openAIExtraConcurrencyAccountRepository) ListSchedulableByPlatform(_ context.Context, platform string) ([]service.Account, error) {
+	return r.list(0, platform), nil
+}
+
+func (r openAIExtraConcurrencyAccountRepository) ListSchedulableUngroupedByPlatform(_ context.Context, platform string) ([]service.Account, error) {
+	return r.list(0, platform), nil
+}
+
+func (r openAIExtraConcurrencyAccountRepository) UpdateLastUsed(context.Context, int64) error {
+	return nil
+}
+
+func (r openAIExtraConcurrencyAccountRepository) BatchUpdateLastUsed(context.Context, map[int64]time.Time) error {
+	return nil
+}
+
+func (r openAIExtraConcurrencyAccountRepository) UpdateExtra(context.Context, int64, map[string]any) error {
+	return nil
+}
+
+func (r openAIExtraConcurrencyAccountRepository) list(groupID int64, platform string) []service.Account {
+	accounts := make([]service.Account, 0, len(r.accounts))
+	for _, account := range r.accounts {
+		if account.Platform != platform {
+			continue
+		}
+		if groupID > 0 {
+			matched := false
+			for _, accountGroupID := range account.GroupIDs {
+				if accountGroupID == groupID {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+		accounts = append(accounts, account)
+	}
+	return accounts
+}
+
+type openAIExtraConcurrencyCapacity struct {
+	accountConcurrency map[int64]int
+}
+
+func (c openAIExtraConcurrencyCapacity) AdmissionCapacity(context.Context, string) (service.AdmissionCapacitySnapshot, error) {
+	total := 0
+	for _, concurrency := range c.accountConcurrency {
+		total += concurrency
+	}
+	return service.AdmissionCapacitySnapshot{
+		TotalConcurrency:   total,
+		AccountConcurrency: c.accountConcurrency,
+	}, nil
+}
+
+type blockingOpenAIExtraConcurrencyUpstream struct {
+	arrivals chan int64
+	release  <-chan struct{}
+	calls    atomic.Int32
+}
+
+func (u *blockingOpenAIExtraConcurrencyUpstream) Do(req *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
+	u.calls.Add(1)
+	u.arrivals <- accountID
+	<-u.release
+	body := `{"id":"resp_extra","object":"response","status":"completed","model":"gpt-5.1","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`
+	if req != nil && strings.Contains(req.URL.Path, "chat/completions") {
+		body = `{"id":"chatcmpl_extra","object":"chat.completion","created":1,"model":"gpt-5.1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}, nil
+}
+
+func (u *blockingOpenAIExtraConcurrencyUpstream) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	return u.Do(req, proxyURL, accountID, accountConcurrency)
+}
+
+type openAIExtraConcurrencyRoutesHarness struct {
+	router *gin.Engine
+	store  service.GatewayAdmissionStore
+	userID int64
+}
+
+func newOpenAIExtraConcurrencyRoutesHarness(
+	t *testing.T,
+	settings extraConcurrencySettingRepository,
+	upstream service.HTTPUpstream,
+	accountExtra map[string]any,
+) *openAIExtraConcurrencyRoutesHarness {
+	t.Helper()
+	if accountExtra == nil {
+		accountExtra = map[string]any{"openai_passthrough": true}
+	}
+	gin.SetMode(gin.TestMode)
+	rdb := startAuthRouteRedis(t, context.Background())
+	groupID := int64(2301)
+	userID := int64(4301)
+	accounts := []service.Account{
+		{
+			ID:          1301,
+			Name:        "openai-extra-1",
+			Platform:    service.PlatformOpenAI,
+			Type:        service.AccountTypeAPIKey,
+			Concurrency: 1,
+			Priority:    0,
+			Status:      service.StatusActive,
+			Schedulable: true,
+			Credentials: map[string]any{"api_key": "sk-1", "base_url": "https://api.openai.com"},
+			Extra:       accountExtra,
+			GroupIDs:    []int64{groupID},
+		},
+		{
+			ID:          1302,
+			Name:        "openai-extra-2",
+			Platform:    service.PlatformOpenAI,
+			Type:        service.AccountTypeAPIKey,
+			Concurrency: 1,
+			Priority:    1,
+			Status:      service.StatusActive,
+			Schedulable: true,
+			Credentials: map[string]any{"api_key": "sk-2", "base_url": "https://api.openai.com"},
+			Extra:       accountExtra,
+			GroupIDs:    []int64{groupID},
+		},
+	}
+	group := &service.Group{ID: groupID, Hydrated: true, Platform: service.PlatformOpenAI, Status: service.StatusActive}
+	accountRepo := openAIExtraConcurrencyAccountRepository{accounts: accounts}
+	cfg := &config.Config{RunMode: config.RunModeSimple}
+	cfg.Default.RateMultiplier = 1
+	cfg.Gateway.Scheduling.LoadBatchEnabled = true
+	legacyConcurrency := service.NewConcurrencyService(repository.NewConcurrencyCache(rdb, 1, 30))
+	billingCacheService := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
+	t.Cleanup(billingCacheService.Stop)
+	openAIService := service.NewOpenAIGatewayService(
+		accountRepo,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		cfg,
+		nil,
+		legacyConcurrency,
+		service.NewBillingService(cfg, nil),
+		nil,
+		billingCacheService,
+		upstream,
+		&service.DeferredService{},
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+	settingService := service.NewSettingService(settings, cfg)
+	admissionStore := repository.NewGatewayAdmissionStore(rdb, 5*time.Second)
+	admission := service.NewGatewayAdmission(
+		admissionStore,
+		nil,
+		openAIExtraConcurrencyCapacity{accountConcurrency: map[int64]int{1301: 1, 1302: 1}},
+	)
+	openAIHandler := handler.NewOpenAIGatewayHandler(
+		openAIService,
+		legacyConcurrency,
+		admission,
+		billingCacheService,
+		service.NewAPIKeyService(nil, nil, nil, nil, nil, nil, cfg),
+		nil,
+		nil,
+		nil,
+		nil,
+		cfg,
+		settingService,
+	)
+	apiKey := &service.APIKey{
+		ID:      3301,
+		UserID:  userID,
+		GroupID: &groupID,
+		Status:  service.StatusActive,
+		User: &service.User{
+			ID:               userID,
+			Status:           service.StatusActive,
+			Concurrency:      1,
+			ExtraConcurrency: 1,
+			Balance:          100,
+		},
+		Group: group,
+	}
+	router := gin.New()
+	router.POST("/v1/responses", func(c *gin.Context) {
+		c.Set(string(servermiddleware.ContextKeyAPIKey), apiKey)
+		c.Set(string(servermiddleware.ContextKeyUser), servermiddleware.AuthSubject{
+			UserID:           userID,
+			Concurrency:      1,
+			ExtraConcurrency: 1,
+		})
+		openAIHandler.Responses(c)
+	})
+	router.POST("/v1/chat/completions", func(c *gin.Context) {
+		c.Set(string(servermiddleware.ContextKeyAPIKey), apiKey)
+		c.Set(string(servermiddleware.ContextKeyUser), servermiddleware.AuthSubject{
+			UserID:           userID,
+			Concurrency:      1,
+			ExtraConcurrency: 1,
+		})
+		openAIHandler.ChatCompletions(c)
+	})
+	return &openAIExtraConcurrencyRoutesHarness{
+		router: router,
+		store:  admissionStore,
+		userID: userID,
+	}
+}
+
+func (h *openAIExtraConcurrencyRoutesHarness) responsesRequest(session string) *httptest.ResponseRecorder {
+	body := `{"model":"gpt-5.1","stream":false,"prompt_cache_key":"` + session + `","input":"hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	h.router.ServeHTTP(recorder, req)
+	return recorder
+}
+
+func (h *openAIExtraConcurrencyRoutesHarness) chatCompletionsRequest(session string) *httptest.ResponseRecorder {
+	body := `{"model":"gpt-5.1","stream":false,"prompt_cache_key":"` + session + `","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	h.router.ServeHTTP(recorder, req)
+	return recorder
 }
 
 type extraConcurrencyUpstream struct {
@@ -365,4 +630,190 @@ func TestGatewayMessagesExtraConcurrencyTimeoutUsesRealRedisWithoutUpstream(t *t
 	require.Equal(t, http.StatusTooManyRequests, recorder.Code)
 	require.Contains(t, recorder.Body.String(), "EXTRA_CONCURRENCY_UNAVAILABLE")
 	require.Zero(t, harness.upstream.calls.Load())
+}
+
+func TestOpenAIResponsesExtraConcurrencyDispatchesSecondConcurrentRequest(t *testing.T) {
+	releaseUpstream := make(chan struct{})
+	upstream := &blockingOpenAIExtraConcurrencyUpstream{
+		arrivals: make(chan int64, 2),
+		release:  releaseUpstream,
+	}
+	harness := newOpenAIExtraConcurrencyRoutesHarness(t, extraConcurrencySettingRepository{}, upstream, nil)
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	go func() { responses <- harness.responsesRequest("first") }()
+	firstAccountID := <-upstream.arrivals
+	go func() { responses <- harness.responsesRequest("second") }()
+
+	secondReachedBeforeRelease := false
+	select {
+	case secondAccountID := <-upstream.arrivals:
+		secondReachedBeforeRelease = true
+		require.NotEqual(t, firstAccountID, secondAccountID)
+	case <-time.After(750 * time.Millisecond):
+	}
+	close(releaseUpstream)
+	firstResponse := <-responses
+	secondResponse := <-responses
+
+	require.True(t, secondReachedBeforeRelease)
+	require.Equal(t, http.StatusOK, firstResponse.Code)
+	require.Equal(t, http.StatusOK, secondResponse.Code)
+	require.Equal(t, int32(2), upstream.calls.Load())
+}
+
+func TestOpenAIResponsesExtraConcurrencyTimeoutUsesRealRedisWithoutUpstream(t *testing.T) {
+	upstream := &extraConcurrencyUpstream{}
+	harness := newOpenAIExtraConcurrencyRoutesHarness(t, extraConcurrencySettingRepository{
+		waitTimeoutSeconds: 1,
+		reservePercent:     100,
+		minReservedSlots:   1,
+	}, upstream, nil)
+	blocker, err := harness.store.TryAcquireUserLease(t.Context(), service.UserLeaseRequest{
+		RequestID:     "openai-standard-blocker",
+		UserID:        harness.userID,
+		StandardLimit: 1,
+		ExtraLimit:    1,
+		MaxWaiting:    20,
+		WaitTimeout:   2 * time.Second,
+	})
+	require.NoError(t, err)
+	require.True(t, blocker.Acquired)
+	require.Equal(t, service.AdmissionClassStandard, blocker.Class)
+	t.Cleanup(func() {
+		_ = harness.store.ReleaseUserLease(context.Background(), harness.userID, "openai-standard-blocker")
+	})
+
+	recorder := harness.responsesRequest("timeout")
+
+	require.Equal(t, http.StatusTooManyRequests, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "EXTRA_CONCURRENCY_UNAVAILABLE")
+	require.Zero(t, upstream.calls.Load())
+}
+
+func TestOpenAIChatCompletionsExtraConcurrencyDispatchesSecondConcurrentRequest(t *testing.T) {
+	releaseUpstream := make(chan struct{})
+	upstream := &blockingOpenAIExtraConcurrencyUpstream{
+		arrivals: make(chan int64, 2),
+		release:  releaseUpstream,
+	}
+	harness := newOpenAIExtraConcurrencyRoutesHarness(
+		t,
+		extraConcurrencySettingRepository{},
+		upstream,
+		map[string]any{
+			"openai_passthrough":    true,
+			"openai_responses_mode": "force_chat_completions",
+		},
+	)
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	go func() { responses <- harness.chatCompletionsRequest("first-chat") }()
+	firstAccountID := <-upstream.arrivals
+	go func() { responses <- harness.chatCompletionsRequest("second-chat") }()
+
+	secondReachedBeforeRelease := false
+	select {
+	case secondAccountID := <-upstream.arrivals:
+		secondReachedBeforeRelease = true
+		require.NotEqual(t, firstAccountID, secondAccountID)
+	case <-time.After(750 * time.Millisecond):
+	}
+	close(releaseUpstream)
+	firstResponse := <-responses
+	secondResponse := <-responses
+
+	require.True(t, secondReachedBeforeRelease)
+	require.Equal(t, http.StatusOK, firstResponse.Code)
+	require.Equal(t, http.StatusOK, secondResponse.Code)
+	require.Equal(t, int32(2), upstream.calls.Load())
+}
+
+func TestOpenAIChatCompletionsExtraConcurrencyTimeoutUsesRealRedisWithoutUpstream(t *testing.T) {
+	upstream := &extraConcurrencyUpstream{}
+	harness := newOpenAIExtraConcurrencyRoutesHarness(t, extraConcurrencySettingRepository{
+		waitTimeoutSeconds: 1,
+		reservePercent:     100,
+		minReservedSlots:   1,
+	}, upstream, map[string]any{
+		"openai_passthrough":    true,
+		"openai_responses_mode": "force_chat_completions",
+	})
+	blocker, err := harness.store.TryAcquireUserLease(t.Context(), service.UserLeaseRequest{
+		RequestID:     "openai-chat-standard-blocker",
+		UserID:        harness.userID,
+		StandardLimit: 1,
+		ExtraLimit:    1,
+		MaxWaiting:    20,
+		WaitTimeout:   2 * time.Second,
+	})
+	require.NoError(t, err)
+	require.True(t, blocker.Acquired)
+	require.Equal(t, service.AdmissionClassStandard, blocker.Class)
+	t.Cleanup(func() {
+		_ = harness.store.ReleaseUserLease(context.Background(), harness.userID, "openai-chat-standard-blocker")
+	})
+
+	recorder := harness.chatCompletionsRequest("chat-timeout")
+
+	require.Equal(t, http.StatusTooManyRequests, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "EXTRA_CONCURRENCY_UNAVAILABLE")
+	require.Zero(t, upstream.calls.Load())
+}
+
+func TestOpenAIResponsesFeatureDisabledKeepsLegacyStandardLimit(t *testing.T) {
+	releaseUpstream := make(chan struct{})
+	upstream := &blockingOpenAIExtraConcurrencyUpstream{
+		arrivals: make(chan int64, 2),
+		release:  releaseUpstream,
+	}
+	harness := newOpenAIExtraConcurrencyRoutesHarness(t, extraConcurrencySettingRepository{disabled: true}, upstream, nil)
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	go func() { responses <- harness.responsesRequest("feature-off-first") }()
+	<-upstream.arrivals
+	go func() { responses <- harness.responsesRequest("feature-off-second") }()
+
+	secondReachedBeforeRelease := false
+	select {
+	case <-upstream.arrivals:
+		secondReachedBeforeRelease = true
+	case <-time.After(750 * time.Millisecond):
+	}
+	close(releaseUpstream)
+	firstResponse := <-responses
+	secondResponse := <-responses
+
+	require.False(t, secondReachedBeforeRelease)
+	require.Equal(t, http.StatusOK, firstResponse.Code)
+	require.Equal(t, http.StatusOK, secondResponse.Code)
+	require.Equal(t, int32(2), upstream.calls.Load())
+}
+
+func TestOpenAIChatCompletionsFeatureDisabledKeepsLegacyStandardLimit(t *testing.T) {
+	releaseUpstream := make(chan struct{})
+	upstream := &blockingOpenAIExtraConcurrencyUpstream{
+		arrivals: make(chan int64, 2),
+		release:  releaseUpstream,
+	}
+	harness := newOpenAIExtraConcurrencyRoutesHarness(t, extraConcurrencySettingRepository{disabled: true}, upstream, map[string]any{
+		"openai_passthrough":    true,
+		"openai_responses_mode": "force_chat_completions",
+	})
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	go func() { responses <- harness.chatCompletionsRequest("feature-off-chat-first") }()
+	<-upstream.arrivals
+	go func() { responses <- harness.chatCompletionsRequest("feature-off-chat-second") }()
+
+	secondReachedBeforeRelease := false
+	select {
+	case <-upstream.arrivals:
+		secondReachedBeforeRelease = true
+	case <-time.After(750 * time.Millisecond):
+	}
+	close(releaseUpstream)
+	firstResponse := <-responses
+	secondResponse := <-responses
+
+	require.False(t, secondReachedBeforeRelease)
+	require.Equal(t, http.StatusOK, firstResponse.Code)
+	require.Equal(t, http.StatusOK, secondResponse.Code)
+	require.Equal(t, int32(2), upstream.calls.Load())
 }

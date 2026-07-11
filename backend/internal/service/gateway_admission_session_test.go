@@ -225,6 +225,50 @@ func TestGatewayAdmissionSessionNextTargetOwnsAtomicTargetLease(t *testing.T) {
 	require.Equal(t, int32(1), store.targetReleaseCalls.Load())
 }
 
+func TestGatewayAdmissionSessionNextTargetUsesInjectedSelector(t *testing.T) {
+	store := &gatewayAdmissionSessionStoreStub{
+		userResult: UserLeaseResult{Acquired: true, Class: AdmissionClassStandard},
+	}
+	admission := NewGatewayAdmission(store, nil, nil)
+	session, err := admission.Begin(context.Background(), GatewayAdmissionRequest{
+		UserID:        910,
+		StandardLimit: 1,
+		ExtraLimit:    1,
+		Settings: ExtraConcurrencyRuntimeSettings{
+			WaitTimeoutSeconds: 1,
+		},
+	})
+	require.NoError(t, err)
+	defer session.Close()
+
+	selectorCalled := false
+	target, err := session.NextTarget(context.Background(), GatewayTargetRequest{
+		Selector: GatewayTargetSelectorFunc(func(ctx context.Context, claimer TargetClaimer) (*AccountSelectionResult, error) {
+			selectorCalled = true
+			account := &Account{
+				ID:          52,
+				Platform:    PlatformOpenAI,
+				Concurrency: 4,
+			}
+			claim, err := tryClaimTarget(ctx, claimer, account)
+			if err != nil {
+				return nil, err
+			}
+			return &AccountSelectionResult{
+				Account:     account,
+				Acquired:    claim.Acquired,
+				ReleaseFunc: claim.ReleaseFunc,
+			}, nil
+		}),
+	})
+
+	require.NoError(t, err)
+	require.True(t, selectorCalled)
+	require.Equal(t, int64(52), target.Account.ID)
+	require.Equal(t, PlatformOpenAI, store.targetRequest.Platform)
+	require.Equal(t, 4, store.targetRequest.AccountLimit)
+}
+
 func TestGatewayAdmissionSessionImmediateTargetDoesNotRefreshUserLease(t *testing.T) {
 	target, session, store := newAdmittedTargetForDispatchTest(t)
 	defer session.Close()

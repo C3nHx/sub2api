@@ -28,10 +28,12 @@ func (c *gatewayAdmissionTargetClaimer) TryClaim(ctx context.Context, target Tar
 	if target.Platform == "" || target.AccountID <= 0 {
 		return nil, false, fmt.Errorf("invalid gateway admission target")
 	}
+	c.releasePendingOnPlatformSwitch(target.Platform)
 
+	unlimited := target.AccountConcurrency <= 0
 	platformCapacity := 0
 	accountLimit := 0
-	if c.capacitySource != nil {
+	if !unlimited && c.capacitySource != nil {
 		snapshot, err := c.capacitySource.AdmissionCapacity(ctx, target.Platform)
 		if err != nil {
 			if c.class == AdmissionClassExtra {
@@ -43,11 +45,11 @@ func (c *gatewayAdmissionTargetClaimer) TryClaim(ctx context.Context, target Tar
 		}
 	}
 
-	if c.class == AdmissionClassStandard && (platformCapacity <= 0 || accountLimit <= 0) {
+	if !unlimited && c.class == AdmissionClassStandard && (platformCapacity <= 0 || accountLimit <= 0) {
 		platformCapacity = math.MaxInt
 		accountLimit = target.AccountConcurrency
 	}
-	if platformCapacity <= 0 || accountLimit <= 0 {
+	if !unlimited && (platformCapacity <= 0 || accountLimit <= 0) {
 		return nil, false, nil
 	}
 	c.recordPending(target)
@@ -65,6 +67,7 @@ func (c *gatewayAdmissionTargetClaimer) TryClaim(ctx context.Context, target Tar
 		ReservedSlots:    gatewayAdmissionReservedSlots(c.settings, target.Platform, platformCapacity),
 		Class:            c.class,
 		WaitTimeout:      waitTimeout,
+		Unlimited:        unlimited,
 	})
 	if err != nil {
 		c.setTerminalError(err)
@@ -118,6 +121,18 @@ func (c *gatewayAdmissionTargetClaimer) recordPending(target TargetClaimRequest)
 		return
 	}
 	c.pending = target
+	c.pendingMu.Unlock()
+	c.releasePendingTarget(previous)
+}
+
+func (c *gatewayAdmissionTargetClaimer) releasePendingOnPlatformSwitch(platform string) {
+	c.pendingMu.Lock()
+	previous := c.pending
+	if previous.Platform == "" || previous.Platform == platform {
+		c.pendingMu.Unlock()
+		return
+	}
+	c.pending = TargetClaimRequest{}
 	c.pendingMu.Unlock()
 	c.releasePendingTarget(previous)
 }

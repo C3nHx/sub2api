@@ -106,11 +106,41 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
 	routingStart := time.Now()
 
-	admission, acquired := h.beginResponsesAdmission(c, subject.UserID, subject.Concurrency, reqStream, &streamStarted, reqLog)
-	if !acquired {
+	extraSettings := service.ExtraConcurrencyRuntimeSettings{}
+	useExtraAdmission := false
+	if (requestPlatform == service.PlatformOpenAI || requestPlatform == service.PlatformGrok) && h.gatewayAdmission != nil && h.settingService != nil {
+		extraSettings = h.settingService.GetExtraConcurrencyRuntimeSettings(c.Request.Context())
+		useExtraAdmission = extraSettings.Enabled
+	}
+	var (
+		admission      *RequestAdmission
+		extraAdmission *service.GatewayAdmissionSession
+	)
+	if useExtraAdmission {
+		extraAdmission, err = h.gatewayAdmission.Begin(c.Request.Context(), service.GatewayAdmissionRequest{
+			UserID:        subject.UserID,
+			StandardLimit: subject.Concurrency,
+			ExtraLimit:    subject.ExtraConcurrency,
+			Settings:      extraSettings,
+		})
+		if err == nil {
+			release := h.concurrencyHelper.withAPIKeySlotFromGin(c, extraAdmission.Close)
+			release = wrapReleaseOnDone(c.Request.Context(), release)
+			defer release()
+		}
+	} else {
+		var acquired bool
+		admission, acquired = h.beginResponsesAdmission(c, subject.UserID, subject.Concurrency, reqStream, &streamStarted, reqLog)
+		if !acquired {
+			return
+		}
+		defer admission.Close()
+	}
+	if err != nil {
+		reqLog.Warn("openai_chat_completions.user_slot_acquire_failed", zap.Error(err))
+		h.handleConcurrencyError(c, err, "user", streamStarted)
 		return
 	}
-	defer admission.Close()
 
 	if err := h.billingCacheService.CheckBillingEligibility(c.Request.Context(), apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(c.Request.Context(), apiKey)); err != nil {
 		reqLog.Info("openai_chat_completions.billing_eligibility_check_failed", zap.Error(err))
@@ -133,24 +163,59 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 
 	for {
 		reqLog.Debug("openai_chat_completions.account_selecting", zap.Int("excluded_account_count", len(failedAccountIDs)))
-		selection, scheduleDecision, err := h.gatewayService.SelectAccountWithSchedulerForCapability(
-			c.Request.Context(),
-			apiKey.GroupID,
-			"",
-			sessionHash,
-			reqModel,
-			failedAccountIDs,
-			service.OpenAIUpstreamTransportAny,
-			service.OpenAIEndpointCapabilityChatCompletions,
-			false,
-			false,
-			requestPlatform,
+		var (
+			selection        *service.AccountSelectionResult
+			scheduleDecision service.OpenAIAccountScheduleDecision
+			admittedTarget   *service.AdmittedTarget
 		)
+		if useExtraAdmission {
+			admittedTarget, err = extraAdmission.NextTarget(c.Request.Context(), service.GatewayTargetRequest{
+				Selector: service.GatewayTargetSelectorFunc(func(ctx context.Context, claimer service.TargetClaimer) (*service.AccountSelectionResult, error) {
+					var selectErr error
+					selection, scheduleDecision, selectErr = h.gatewayService.SelectAccountWithSchedulerForCapabilityAndClaimer(
+						ctx,
+						apiKey.GroupID,
+						"",
+						sessionHash,
+						reqModel,
+						failedAccountIDs,
+						service.OpenAIUpstreamTransportAny,
+						service.OpenAIEndpointCapabilityChatCompletions,
+						false,
+						false,
+						requestPlatform,
+						claimer,
+					)
+					return selection, selectErr
+				}),
+			})
+			if admittedTarget != nil {
+				selection = &service.AccountSelectionResult{Account: admittedTarget.Account, Acquired: true}
+			}
+		} else {
+			selection, scheduleDecision, err = h.gatewayService.SelectAccountWithSchedulerForCapability(
+				c.Request.Context(),
+				apiKey.GroupID,
+				"",
+				sessionHash,
+				reqModel,
+				failedAccountIDs,
+				service.OpenAIUpstreamTransportAny,
+				service.OpenAIEndpointCapabilityChatCompletions,
+				false,
+				false,
+				requestPlatform,
+			)
+		}
 		if err != nil {
 			reqLog.Warn("openai_chat_completions.account_select_failed",
 				zap.Error(err),
 				zap.Int("excluded_account_count", len(failedAccountIDs)),
 			)
+			if useExtraAdmission && isGatewayAdmissionConcurrencyError(err) {
+				h.handleConcurrencyError(c, err, "account", streamStarted)
+				return
+			}
 			if len(failedAccountIDs) == 0 {
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, service.PlatformOpenAI)
 				if !cls.ModelNotFound {
@@ -181,7 +246,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		_ = scheduleDecision
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
-		if !h.admitResponsesAccount(c, admission, apiKey.GroupID, sessionHash, selection, &streamStarted, reqLog) {
+		if !useExtraAdmission && !h.admitResponsesAccount(c, admission, apiKey.GroupID, sessionHash, selection, &streamStarted, reqLog) {
 			return
 		}
 
@@ -193,10 +258,42 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			forwardBody = h.gatewayService.ReplaceModelInBody(body, channelMapping.MappedModel)
 		}
 		writerSizeBeforeForward := c.Writer.Size()
-		result, err := func() (*service.OpenAIForwardResult, error) {
-			defer admission.ReleaseAccount()
-			return h.gatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, promptCacheKey, "")
-		}()
+		var result *service.OpenAIForwardResult
+		var billingRecheckErr error
+		if useExtraAdmission {
+			err = admittedTarget.Dispatch(
+				c.Request.Context(),
+				func(ctx context.Context) error {
+					billingRecheckErr = h.billingCacheService.RecheckBillingEligibility(
+						ctx,
+						apiKey.User,
+						apiKey,
+						apiKey.Group,
+						subscription,
+						service.QuotaPlatform(ctx, apiKey),
+					)
+					return billingRecheckErr
+				},
+				func(ctx context.Context, targetAccount *service.Account) error {
+					result, err = h.gatewayService.ForwardAsChatCompletions(ctx, c, targetAccount, forwardBody, promptCacheKey, "")
+					return err
+				},
+			)
+		} else {
+			result, err = func() (*service.OpenAIForwardResult, error) {
+				defer admission.ReleaseAccount()
+				return h.gatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, promptCacheKey, "")
+			}()
+		}
+		if billingRecheckErr != nil {
+			reqLog.Info("openai_chat_completions.billing_eligibility_recheck_failed", zap.Error(billingRecheckErr))
+			status, code, message, retryAfter := billingErrorDetails(billingRecheckErr)
+			if retryAfter > 0 {
+				c.Header("Retry-After", strconv.Itoa(retryAfter))
+			}
+			h.handleStreamingAwareError(c, status, code, message, streamStarted)
+			return
+		}
 		cyberBlockKeyChat := ""
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockKeyChat = service.CyberSessionBlockKey(apiKey.ID, c, body)

@@ -202,27 +202,60 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 	// Get subscription (may be nil)
 	subscription, _ := middleware.GetSubscriptionFromContext(c)
 
-	// For Gemini native API, do not send Claude-style ping frames.
-	geminiConcurrency := NewConcurrencyHelper(h.concurrencyHelper.concurrencyService, SSEPingFormatNone, 0)
-
 	// 1) user concurrency slot
 	streamStarted := false
 	if h.errorPassthroughService != nil {
 		service.BindErrorPassthroughService(c, h.errorPassthroughService)
 	}
-	admission, err := geminiConcurrency.Begin(c, UserAdmissionRequest{
-		UserID:         authSubject.UserID,
-		MaxConcurrency: authSubject.Concurrency,
-		Mode:           AdmissionModeWait,
-		Stream:         stream,
-		StreamStarted:  &streamStarted,
-	})
+	requestPlatform := service.PlatformGemini
+	if forcePlatform, ok := middleware.GetForcePlatformFromContext(c); ok {
+		requestPlatform = forcePlatform
+	}
+	extraSettings := service.ExtraConcurrencyRuntimeSettings{}
+	useExtraAdmission := false
+	if (requestPlatform == service.PlatformGemini || requestPlatform == service.PlatformAntigravity) && h.gatewayAdmission != nil && h.settingService != nil {
+		extraSettings = h.settingService.GetExtraConcurrencyRuntimeSettings(c.Request.Context())
+		useExtraAdmission = extraSettings.Enabled
+	}
+	var (
+		admission      *RequestAdmission
+		extraAdmission *service.GatewayAdmissionSession
+	)
+	if useExtraAdmission {
+		extraAdmission, err = h.gatewayAdmission.Begin(c.Request.Context(), service.GatewayAdmissionRequest{
+			UserID:        authSubject.UserID,
+			StandardLimit: authSubject.Concurrency,
+			ExtraLimit:    authSubject.ExtraConcurrency,
+			Settings:      extraSettings,
+		})
+		if err == nil {
+			release := h.concurrencyHelper.withAPIKeySlotFromGin(c, extraAdmission.Close)
+			release = wrapReleaseOnDone(c.Request.Context(), release)
+			defer release()
+		}
+	} else {
+		// Feature-off compatibility is structural: retain the legacy helper path.
+		geminiConcurrency := NewConcurrencyHelper(h.concurrencyHelper.concurrencyService, SSEPingFormatNone, 0)
+		admission, err = geminiConcurrency.Begin(c, UserAdmissionRequest{
+			UserID:         authSubject.UserID,
+			MaxConcurrency: authSubject.Concurrency,
+			Mode:           AdmissionModeWait,
+			Stream:         stream,
+			StreamStarted:  &streamStarted,
+		})
+		if err == nil {
+			defer admission.Close()
+		}
+	}
 	if err != nil {
 		reqLog.Warn("gemini.user_slot_acquire_failed", zap.Error(err))
-		googleError(c, http.StatusTooManyRequests, err.Error())
+		if useExtraAdmission {
+			googleConcurrencyError(c, err, "user")
+		} else {
+			googleError(c, http.StatusTooManyRequests, err.Error())
+		}
 		return
 	}
-	defer admission.Close()
 
 	// 2) billing eligibility check (after wait)
 	if err := h.billingCacheService.CheckBillingEligibility(c.Request.Context(), apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(c.Request.Context(), apiKey)); err != nil {
@@ -349,8 +382,26 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 	}
 
 	for {
-		selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, sessionKey, modelName, fs.FailedAccountIDs, "", int64(0)) // Gemini 不使用会话限制
+		var (
+			selection      *service.AccountSelectionResult
+			admittedTarget *service.AdmittedTarget
+		)
+		if useExtraAdmission {
+			admittedTarget, err = extraAdmission.NextTarget(c.Request.Context(), service.GatewayTargetRequest{
+				GroupID:            apiKey.GroupID,
+				SessionKey:         sessionKey,
+				Model:              modelName,
+				ExcludedAccountIDs: fs.FailedAccountIDs,
+			})
+		} else {
+			selection, err = h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, sessionKey, modelName, fs.FailedAccountIDs, "", int64(0)) // Gemini 不使用会话限制
+		}
 		if err != nil {
+			if useExtraAdmission && (isGatewayAdmissionConcurrencyError(err) || errors.Is(err, context.Canceled)) {
+				reqLog.Warn("gemini.extra_admission_failed", zap.Error(err))
+				googleConcurrencyError(c, err, "account")
+				return
+			}
 			if len(fs.FailedAccountIDs) == 0 {
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, modelName, modelName, service.PlatformGemini)
 				if !cls.ModelNotFound {
@@ -376,7 +427,12 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 				return
 			}
 		}
-		account := selection.Account
+		var account *service.Account
+		if useExtraAdmission {
+			account = admittedTarget.Account
+		} else {
+			account = selection.Account
+		}
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
 		// 检测账号切换：如果粘性会话绑定的账号与当前选择的账号不同，清除 thoughtSignature
@@ -403,25 +459,27 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 			sessionBoundAccountID = account.ID
 		}
 
-		// 4) account concurrency slot
-		waitedForAccount := !selection.Acquired
-		if err := admission.AdmitAccount(AccountAdmissionRequest{
-			Selection:  selection,
-			WaitPolicy: AccountWaitPolicyTracked,
-		}); err != nil {
-			var unavailableErr *AccountUnavailableError
-			if errors.As(err, &unavailableErr) {
-				markOpsRoutingCapacityLimited(c)
-				googleError(c, http.StatusServiceUnavailable, "No available Gemini accounts")
+		// 4) account concurrency slot. The shared path already holds the target lease atomically.
+		if !useExtraAdmission {
+			waitedForAccount := !selection.Acquired
+			if err := admission.AdmitAccount(AccountAdmissionRequest{
+				Selection:  selection,
+				WaitPolicy: AccountWaitPolicyTracked,
+			}); err != nil {
+				var unavailableErr *AccountUnavailableError
+				if errors.As(err, &unavailableErr) {
+					markOpsRoutingCapacityLimited(c)
+					googleError(c, http.StatusServiceUnavailable, "No available Gemini accounts")
+					return
+				}
+				reqLog.Warn("gemini.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+				googleError(c, http.StatusTooManyRequests, err.Error())
 				return
 			}
-			reqLog.Warn("gemini.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
-			googleError(c, http.StatusTooManyRequests, err.Error())
-			return
-		}
-		if waitedForAccount {
-			if err := h.gatewayService.BindStickySession(c.Request.Context(), apiKey.GroupID, sessionKey, account.ID); err != nil {
-				reqLog.Warn("gemini.bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+			if waitedForAccount {
+				if err := h.gatewayService.BindStickySession(c.Request.Context(), apiKey.GroupID, sessionKey, account.ID); err != nil {
+					reqLog.Warn("gemini.bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+				}
 			}
 		}
 
@@ -432,22 +490,54 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 			requestCtx = service.WithAccountSwitchCount(requestCtx, fs.SwitchCount, h.metadataBridgeEnabled())
 		}
 		sessionGroupID := derefGroupID(apiKey.GroupID)
-		if account.Platform == service.PlatformAntigravity && account.Type != service.AccountTypeAPIKey {
-			result, err = h.antigravityGatewayService.ForwardGemini(
+		forwardAttempt := func(ctx context.Context, targetAccount *service.Account) error {
+			if targetAccount.Platform == service.PlatformAntigravity && targetAccount.Type != service.AccountTypeAPIKey {
+				result, err = h.antigravityGatewayService.ForwardGemini(
+					ctx,
+					c,
+					targetAccount,
+					modelName,
+					action,
+					stream,
+					body,
+					hasBoundSession,
+					service.WithForwardGeminiSession(sessionGroupID, sessionKey),
+				)
+			} else {
+				result, err = h.geminiCompatService.ForwardNative(ctx, c, targetAccount, modelName, action, stream, body)
+			}
+			return err
+		}
+		var billingRecheckErr error
+		if useExtraAdmission {
+			err = admittedTarget.Dispatch(
 				requestCtx,
-				c,
-				account,
-				modelName,
-				action,
-				stream,
-				body,
-				hasBoundSession,
-				service.WithForwardGeminiSession(sessionGroupID, sessionKey),
+				func(ctx context.Context) error {
+					billingRecheckErr = h.billingCacheService.RecheckBillingEligibility(
+						ctx,
+						apiKey.User,
+						apiKey,
+						apiKey.Group,
+						subscription,
+						service.QuotaPlatform(ctx, apiKey),
+					)
+					return billingRecheckErr
+				},
+				forwardAttempt,
 			)
 		} else {
-			result, err = h.geminiCompatService.ForwardNative(requestCtx, c, account, modelName, action, stream, body)
+			err = forwardAttempt(requestCtx, account)
+			admission.ReleaseAccount()
 		}
-		admission.ReleaseAccount()
+		if billingRecheckErr != nil {
+			reqLog.Info("gemini.billing_eligibility_recheck_failed", zap.Error(billingRecheckErr))
+			status, _, message, retryAfter := billingErrorDetails(billingRecheckErr)
+			if retryAfter > 0 {
+				c.Header("Retry-After", strconv.Itoa(retryAfter))
+			}
+			googleError(c, status, message)
+			return
+		}
 		if err != nil {
 			var failoverErr *service.UpstreamFailoverError
 			if errors.As(err, &failoverErr) {
@@ -611,6 +701,26 @@ func mapGeminiUpstreamError(statusCode int) (int, string) {
 type pathParseError struct{ msg string }
 
 func (e *pathParseError) Error() string { return e.msg }
+
+func googleConcurrencyError(c *gin.Context, err error, slotType string) {
+	status, reason, message := concurrencyErrorResponse(err, slotType)
+	if reason != "EXTRA_CONCURRENCY_UNAVAILABLE" {
+		googleError(c, status, message)
+		return
+	}
+	c.JSON(status, gin.H{
+		"error": gin.H{
+			"code":    status,
+			"message": message,
+			"status":  googleapi.HTTPStatusToGoogleStatus(status),
+			"details": []gin.H{{
+				"@type":  "type.googleapis.com/google.rpc.ErrorInfo",
+				"reason": reason,
+				"domain": "sub2api.concurrency",
+			}},
+		},
+	})
+}
 
 func googleError(c *gin.Context, status int, message string) {
 	c.JSON(status, gin.H{

@@ -107,6 +107,37 @@ func TestGatewayAdmissionTargetClaimerUsesAuthoritativeCapacityAndReserveOverrid
 	require.Equal(t, 1, store.releaseCalls)
 }
 
+func TestGatewayAdmissionTargetClaimerPreservesUnlimitedAccountSemantics(t *testing.T) {
+	store := &recordingGatewayAdmissionStore{}
+	capacityCalls := 0
+	claimer := &gatewayAdmissionTargetClaimer{
+		store: store,
+		capacitySource: admissionCapacitySourceFunc(func(context.Context, string) (AdmissionCapacitySnapshot, error) {
+			capacityCalls++
+			return AdmissionCapacitySnapshot{}, nil
+		}),
+		requestID: "unlimited-account",
+		class:     AdmissionClassExtra,
+	}
+
+	release, claimed, err := claimer.TryClaim(context.Background(), TargetClaimRequest{
+		Platform:           PlatformAnthropic,
+		AccountID:          99,
+		AccountConcurrency: 0,
+	})
+
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.NotNil(t, release)
+	require.Zero(t, capacityCalls)
+	require.Equal(t, "unlimited-account", store.targetRequest.RequestID)
+	require.Equal(t, int64(99), store.targetRequest.AccountID)
+	require.True(t, store.targetRequest.Unlimited)
+
+	release()
+	require.Equal(t, 1, store.releaseCalls)
+}
+
 func TestGatewayAdmissionTargetClaimerStandardTimeoutUsesStandardError(t *testing.T) {
 	store := &recordingGatewayAdmissionStore{
 		targetResult: TargetLeaseResult{Expired: true},
@@ -184,6 +215,45 @@ func TestGatewayAdmissionTargetClaimerReleasesPendingTargetBeforeSwitchingPlatfo
 		{Platform: PlatformAnthropic, AccountID: 1},
 		{Platform: PlatformAntigravity, AccountID: 2},
 	}, store.released)
+}
+
+func TestGatewayAdmissionTargetClaimerReleasesPendingWhenNewPlatformHasNoCapacity(t *testing.T) {
+	store := &switchingGatewayAdmissionStore{
+		results: map[string]TargetLeaseResult{
+			PlatformAnthropic: {},
+		},
+	}
+	claimer := &gatewayAdmissionTargetClaimer{
+		store: store,
+		capacitySource: admissionCapacitySourceFunc(func(_ context.Context, platform string) (AdmissionCapacitySnapshot, error) {
+			if platform == PlatformAnthropic {
+				return AdmissionCapacitySnapshot{
+					TotalConcurrency:   1,
+					AccountConcurrency: map[int64]int{1: 1},
+				}, nil
+			}
+			return AdmissionCapacitySnapshot{}, nil
+		}),
+		requestID: "cross-platform-no-capacity",
+		class:     AdmissionClassExtra,
+	}
+
+	_, claimed, err := claimer.TryClaim(context.Background(), TargetClaimRequest{
+		Platform:           PlatformAnthropic,
+		AccountID:          1,
+		AccountConcurrency: 1,
+	})
+	require.NoError(t, err)
+	require.False(t, claimed)
+
+	_, claimed, err = claimer.TryClaim(context.Background(), TargetClaimRequest{
+		Platform:           PlatformAntigravity,
+		AccountID:          2,
+		AccountConcurrency: 1,
+	})
+	require.NoError(t, err)
+	require.False(t, claimed)
+	require.Equal(t, []TargetClaimRequest{{Platform: PlatformAnthropic, AccountID: 1}}, store.released)
 }
 
 func TestGatewayAdmissionTargetClaimerPreservesPendingQueueWhenSwitchingAccountOnSamePlatform(t *testing.T) {

@@ -142,6 +142,7 @@ var (
 		local ttlMs = tonumber(ARGV[6])
 		local ttlSeconds = math.max(math.ceil(ttlMs / 1000), 1)
 		local waitTimeoutMs = tonumber(ARGV[7])
+		local unlimited = tonumber(ARGV[8]) == 1
 
 		-- platformKey is private and stores expires-at milliseconds. accountKey is
 		-- shared with concurrencyCache and must keep last-seen Unix seconds.
@@ -232,6 +233,12 @@ var (
 			if extraHead ~= requestID then
 				return 0
 			end
+		end
+		if unlimited then
+			redis.call('ZREM', standardQueueKey, requestID)
+			redis.call('ZREM', extraQueueKey, requestID)
+			redis.call('ZREM', deadlineKey, requestID)
+			return 1
 		end
 
 		local platformLimit = platformCapacity
@@ -427,7 +434,7 @@ func (s *gatewayAdmissionStore) TryAcquireTargetLease(ctx context.Context, reque
 	if request.RequestID == "" || request.Platform == "" || request.AccountID <= 0 {
 		return service.TargetLeaseResult{}, fmt.Errorf("invalid gateway admission target lease request")
 	}
-	if request.AccountLimit <= 0 || request.PlatformCapacity <= 0 {
+	if !request.Unlimited && (request.AccountLimit <= 0 || request.PlatformCapacity <= 0) {
 		return service.TargetLeaseResult{}, nil
 	}
 
@@ -436,10 +443,17 @@ func (s *gatewayAdmissionStore) TryAcquireTargetLease(ctx context.Context, reque
 		return service.TargetLeaseResult{}, err
 	}
 
-	reservedSlots := min(max(request.ReservedSlots, 0), request.PlatformCapacity)
+	reservedSlots := 0
+	if !request.Unlimited {
+		reservedSlots = min(max(request.ReservedSlots, 0), request.PlatformCapacity)
+	}
 	waitTimeoutMS := request.WaitTimeout.Milliseconds()
 	if waitTimeoutMS < 1 {
 		waitTimeoutMS = s.leaseTTLMS
+	}
+	unlimitedFlag := 0
+	if request.Unlimited {
+		unlimitedFlag = 1
 	}
 	decision, err := acquireGatewayTargetLeaseScript.Run(
 		ctx,
@@ -452,6 +466,7 @@ func (s *gatewayAdmissionStore) TryAcquireTargetLease(ctx context.Context, reque
 		request.AccountLimit,
 		s.leaseTTLMS,
 		waitTimeoutMS,
+		unlimitedFlag,
 	).Int64()
 	if err != nil {
 		return service.TargetLeaseResult{}, fmt.Errorf("acquire gateway admission target lease: %w", err)

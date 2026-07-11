@@ -225,7 +225,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 
 	extraSettings := service.ExtraConcurrencyRuntimeSettings{}
 	useExtraAdmission := false
-	if platform == service.PlatformAnthropic && h.gatewayAdmission != nil && h.settingService != nil {
+	if (platform == service.PlatformAnthropic || platform == service.PlatformGemini || platform == service.PlatformAntigravity) && h.gatewayAdmission != nil && h.settingService != nil {
 		extraSettings = h.settingService.GetExtraConcurrencyRuntimeSettings(c.Request.Context())
 		useExtraAdmission = extraSettings.Enabled
 	}
@@ -332,8 +332,26 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		}
 
 		for {
-			selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, sessionKey, reqModel, fs.FailedAccountIDs, "", int64(0)) // Gemini 不使用会话限制
+			var (
+				selection      *service.AccountSelectionResult
+				admittedTarget *service.AdmittedTarget
+			)
+			if useExtraAdmission {
+				admittedTarget, err = extraAdmission.NextTarget(c.Request.Context(), service.GatewayTargetRequest{
+					GroupID:            apiKey.GroupID,
+					SessionKey:         sessionKey,
+					Model:              reqModel,
+					ExcludedAccountIDs: fs.FailedAccountIDs,
+				})
+			} else {
+				selection, err = h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, sessionKey, reqModel, fs.FailedAccountIDs, "", int64(0)) // Gemini 不使用会话限制
+			}
 			if err != nil {
+				if useExtraAdmission && (isGatewayAdmissionConcurrencyError(err) || errors.Is(err, context.Canceled)) {
+					reqLog.Warn("gateway.extra_admission_failed", zap.Error(err))
+					h.handleConcurrencyError(c, err, "account", streamStarted)
+					return
+				}
 				if len(fs.FailedAccountIDs) == 0 {
 					cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, service.PlatformGemini)
 					if !cls.ModelNotFound {
@@ -370,7 +388,12 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					return
 				}
 			}
-			account := selection.Account
+			var account *service.Account
+			if useExtraAdmission {
+				account = admittedTarget.Account
+			} else {
+				account = selection.Account
+			}
 			setOpsSelectedAccount(c, account.ID, account.Platform)
 
 			// 检查请求拦截（预热请求、SUGGESTION MODE等）
@@ -391,30 +414,32 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				}
 			}
 
-			// 3. 获取账号并发槽位
-			waitedForAccount := !selection.Acquired
-			if err := admission.AdmitAccount(AccountAdmissionRequest{
-				Selection:  selection,
-				WaitPolicy: AccountWaitPolicyTracked,
-			}); err != nil {
-				var unavailableErr *AccountUnavailableError
-				if errors.As(err, &unavailableErr) {
-					markOpsRoutingCapacityLimited(c)
-					reqLog.Warn("gateway.select_account_no_slot_no_wait_plan",
-						zap.Int64("account_id", account.ID),
-						zap.String("model", reqModel),
-						zap.String("platform", platform),
-					)
-					h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", "No available accounts", streamStarted)
+			// 3. 获取账号并发槽位。新路径已在 NextTarget 中原子持有目标租约。
+			if !useExtraAdmission {
+				waitedForAccount := !selection.Acquired
+				if err := admission.AdmitAccount(AccountAdmissionRequest{
+					Selection:  selection,
+					WaitPolicy: AccountWaitPolicyTracked,
+				}); err != nil {
+					var unavailableErr *AccountUnavailableError
+					if errors.As(err, &unavailableErr) {
+						markOpsRoutingCapacityLimited(c)
+						reqLog.Warn("gateway.select_account_no_slot_no_wait_plan",
+							zap.Int64("account_id", account.ID),
+							zap.String("model", reqModel),
+							zap.String("platform", platform),
+						)
+						h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", "No available accounts", streamStarted)
+						return
+					}
+					reqLog.Warn("gateway.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+					h.handleConcurrencyError(c, err, "account", streamStarted)
 					return
 				}
-				reqLog.Warn("gateway.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
-				h.handleConcurrencyError(c, err, "account", streamStarted)
-				return
-			}
-			if waitedForAccount {
-				if err := h.gatewayService.BindStickySession(c.Request.Context(), apiKey.GroupID, sessionKey, account.ID); err != nil {
-					reqLog.Warn("gateway.bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+				if waitedForAccount {
+					if err := h.gatewayService.BindStickySession(c.Request.Context(), apiKey.GroupID, sessionKey, account.ID); err != nil {
+						reqLog.Warn("gateway.bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+					}
 				}
 			}
 
@@ -426,22 +451,54 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			}
 			// 记录 Forward 前已写入字节数，Forward 后若增加则说明 SSE 内容已发，禁止 failover
 			writerSizeBeforeForward := c.Writer.Size()
-			if account.Platform == service.PlatformAntigravity {
-				result, err = h.antigravityGatewayService.ForwardGemini(
+			forwardAttempt := func(ctx context.Context, targetAccount *service.Account) error {
+				if targetAccount.Platform == service.PlatformAntigravity {
+					result, err = h.antigravityGatewayService.ForwardGemini(
+						ctx,
+						c,
+						targetAccount,
+						reqModel,
+						"generateContent",
+						reqStream,
+						body,
+						hasBoundSession,
+						service.WithForwardGeminiSession(derefGroupID(apiKey.GroupID), sessionKey),
+					)
+				} else {
+					result, err = h.geminiCompatService.Forward(ctx, c, targetAccount, body)
+				}
+				return err
+			}
+			var billingRecheckErr error
+			if useExtraAdmission {
+				err = admittedTarget.Dispatch(
 					requestCtx,
-					c,
-					account,
-					reqModel,
-					"generateContent",
-					reqStream,
-					body,
-					hasBoundSession,
-					service.WithForwardGeminiSession(derefGroupID(apiKey.GroupID), sessionKey),
+					func(ctx context.Context) error {
+						billingRecheckErr = h.billingCacheService.RecheckBillingEligibility(
+							ctx,
+							apiKey.User,
+							apiKey,
+							apiKey.Group,
+							subscription,
+							service.QuotaPlatform(ctx, apiKey),
+						)
+						return billingRecheckErr
+					},
+					forwardAttempt,
 				)
 			} else {
-				result, err = h.geminiCompatService.Forward(requestCtx, c, account, body)
+				err = forwardAttempt(requestCtx, account)
+				admission.ReleaseAccount()
 			}
-			admission.ReleaseAccount()
+			if billingRecheckErr != nil {
+				reqLog.Info("gateway.billing_eligibility_recheck_failed", zap.Error(billingRecheckErr))
+				status, code, message, retryAfter := billingErrorDetails(billingRecheckErr)
+				if retryAfter > 0 {
+					c.Header("Retry-After", strconv.Itoa(retryAfter))
+				}
+				h.handleStreamingAwareError(c, status, code, message, streamStarted)
+				return
+			}
 			if err != nil {
 				var failoverErr *service.UpstreamFailoverError
 				if errors.As(err, &failoverErr) {
@@ -602,14 +659,10 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				selection, err = h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), currentAPIKey.GroupID, sessionKey, reqModel, fs.FailedAccountIDs, parsedReq.MetadataUserID, subject.UserID)
 			}
 			if err != nil {
-				if useExtraAdmission {
-					var extraUnavailable *service.ExtraConcurrencyUnavailableError
-					var queueFull *service.GatewayAdmissionQueueFullError
-					if errors.As(err, &extraUnavailable) || errors.As(err, &queueFull) || errors.Is(err, context.Canceled) {
-						reqLog.Warn("gateway.extra_admission_failed", zap.Error(err))
-						h.handleConcurrencyError(c, err, "account", streamStarted)
-						return
-					}
+				if useExtraAdmission && (isGatewayAdmissionConcurrencyError(err) || errors.Is(err, context.Canceled)) {
+					reqLog.Warn("gateway.extra_admission_failed", zap.Error(err))
+					h.handleConcurrencyError(c, err, "account", streamStarted)
+					return
 				}
 				if len(fs.FailedAccountIDs) == 0 {
 					cls := classifyNoAccountErrorFromGin(c, h.gatewayService, currentAPIKey, reqModel, reqModel, platform)

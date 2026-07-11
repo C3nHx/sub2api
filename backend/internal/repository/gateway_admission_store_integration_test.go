@@ -107,6 +107,23 @@ func TestGatewayAdmissionStoreExtraTargetPreservesPlatformReserve(t *testing.T) 
 	require.True(t, retried.Acquired)
 }
 
+func TestGatewayAdmissionStoreTracksUnlimitedTargetWithoutCapacityLimit(t *testing.T) {
+	rdb := testRedis(t)
+	store := NewGatewayAdmissionStore(rdb, time.Minute)
+
+	result, err := store.TryAcquireTargetLease(t.Context(), service.TargetLeaseRequest{
+		RequestID: "unlimited-target",
+		Platform:  service.PlatformAnthropic,
+		AccountID: 108,
+		Class:     service.AdmissionClassExtra,
+		Unlimited: true,
+	})
+
+	require.NoError(t, err)
+	require.True(t, result.Acquired)
+	require.NoError(t, store.ReleaseTargetLease(t.Context(), service.PlatformAnthropic, 108, "unlimited-target"))
+}
+
 func TestGatewayAdmissionStoreSharesAccountCapacityWithLegacyConcurrency(t *testing.T) {
 	rdb := testRedis(t)
 	legacy := NewConcurrencyCache(rdb, 1, 60)

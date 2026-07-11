@@ -53,6 +53,17 @@ type GatewayTargetRequest struct {
 	Model              string
 	MetadataUserID     string
 	ExcludedAccountIDs map[int64]struct{}
+	Selector           GatewayTargetSelector
+}
+
+type GatewayTargetSelector interface {
+	Select(ctx context.Context, claimer TargetClaimer) (*AccountSelectionResult, error)
+}
+
+type GatewayTargetSelectorFunc func(context.Context, TargetClaimer) (*AccountSelectionResult, error)
+
+func (f GatewayTargetSelectorFunc) Select(ctx context.Context, claimer TargetClaimer) (*AccountSelectionResult, error) {
+	return f(ctx, claimer)
 }
 
 type AdmittedTarget struct {
@@ -184,7 +195,7 @@ func (s *GatewayAdmissionSession) Waited() bool {
 }
 
 func (s *GatewayAdmissionSession) NextTarget(ctx context.Context, request GatewayTargetRequest) (*AdmittedTarget, error) {
-	if s == nil || s.admission == nil || s.admission.gatewayService == nil {
+	if s == nil || s.admission == nil || (request.Selector == nil && s.admission.gatewayService == nil) {
 		return nil, fmt.Errorf("gateway admission target selection is unavailable")
 	}
 	if ctx == nil {
@@ -227,16 +238,22 @@ func (s *GatewayAdmissionSession) NextTarget(ctx context.Context, request Gatewa
 			}
 		}
 		claimer.class = class
-		selection, err := s.admission.gatewayService.selectAccountWithTargetClaimer(
-			waitCtx,
-			request.GroupID,
-			request.SessionKey,
-			request.Model,
-			request.ExcludedAccountIDs,
-			request.MetadataUserID,
-			s.request.UserID,
-			claimer,
-		)
+		var selection *AccountSelectionResult
+		var err error
+		if request.Selector != nil {
+			selection, err = request.Selector.Select(waitCtx, claimer)
+		} else {
+			selection, err = s.admission.gatewayService.selectAccountWithTargetClaimer(
+				waitCtx,
+				request.GroupID,
+				request.SessionKey,
+				request.Model,
+				request.ExcludedAccountIDs,
+				request.MetadataUserID,
+				s.request.UserID,
+				claimer,
+			)
+		}
 		if err != nil && waitCtx.Err() != nil {
 			return nil, gatewayAdmissionTargetWaitError(ctx, class)
 		}
