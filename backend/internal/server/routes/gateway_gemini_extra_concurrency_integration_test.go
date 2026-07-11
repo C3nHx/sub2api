@@ -111,15 +111,28 @@ func (geminiMessagesRejectLegacyConcurrencyCache) AcquireUserSlot(context.Contex
 }
 
 type geminiMessagesExtraUpstream struct {
-	calls    atomic.Int32
-	arrivals chan int64
-	release  <-chan struct{}
+	calls         atomic.Int32
+	arrivals      chan int64
+	namedArrivals chan string
+	release       <-chan struct{}
+	failFirst     bool
 }
 
-func (u *geminiMessagesExtraUpstream) Do(_ *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
-	u.calls.Add(1)
+func (u *geminiMessagesExtraUpstream) Do(req *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
+	call := u.calls.Add(1)
 	if u.arrivals != nil {
 		u.arrivals <- accountID
+	}
+	if u.namedArrivals != nil {
+		requestName, _ := req.Context().Value(openAIExtraConcurrencyRequestNameKey{}).(string)
+		u.namedArrivals <- strings.ToUpper(requestName)
+	}
+	if u.failFirst && call == 1 {
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"code":400,"message":"Invalid project resource name","status":"INVALID_ARGUMENT"}}`)),
+		}, nil
 	}
 	if u.release != nil {
 		<-u.release
@@ -304,8 +317,13 @@ func newGeminiMessagesExtraRoutesHarness(
 }
 
 func (h *geminiMessagesExtraRoutesHarness) request() *httptest.ResponseRecorder {
-	body := []byte(`{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`)
+	return h.requestWithContent("hello")
+}
+
+func (h *geminiMessagesExtraRoutesHarness) requestWithContent(content string) *httptest.ResponseRecorder {
+	body := []byte(`{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user","content":"` + content + `"}]}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	req = req.WithContext(context.WithValue(req.Context(), openAIExtraConcurrencyRequestNameKey{}, strings.TrimPrefix(content, "request-")))
 	req.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 	h.router.ServeHTTP(recorder, req)
@@ -334,6 +352,43 @@ func TestGatewayGeminiMessagesExtraConcurrencyReachesUpstreamWithRealRedis(t *te
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.Contains(t, recorder.Body.String(), "hello from gemini")
 	require.Equal(t, int32(1), harness.upstream.calls.Load())
+}
+
+func TestGatewayGeminiMessagesSameAccountRetryKeepsTargetLease(t *testing.T) {
+	releaseUpstream := make(chan struct{})
+	t.Cleanup(func() { close(releaseUpstream) })
+	upstream := &geminiMessagesExtraUpstream{
+		namedArrivals: make(chan string, 3),
+		release:       releaseUpstream,
+		failFirst:     true,
+	}
+	harness := newGeminiMessagesExtraRoutesHarness(t, geminiMessagesExtraSettingRepository{}, upstream)
+
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	go func() { responses <- harness.requestWithContent("request-a") }()
+	require.Equal(t, "A", <-upstream.namedArrivals)
+	go func() { responses <- harness.requestWithContent("request-b") }()
+
+	select {
+	case second := <-upstream.namedArrivals:
+		require.Equal(t, "A", second, "same-account retry must run before the waiting request")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the same-account retry")
+	}
+	releaseUpstream <- struct{}{}
+	select {
+	case third := <-upstream.namedArrivals:
+		require.Equal(t, "B", third)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the queued request")
+	}
+	releaseUpstream <- struct{}{}
+
+	firstResponse := <-responses
+	secondResponse := <-responses
+	require.Equal(t, http.StatusOK, firstResponse.Code)
+	require.Equal(t, http.StatusOK, secondResponse.Code)
+	require.Equal(t, int32(3), upstream.calls.Load())
 }
 
 func TestGatewayGeminiMessagesExtraConcurrencyReserveBlocksUpstreamWithRealRedis(t *testing.T) {

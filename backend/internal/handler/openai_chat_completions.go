@@ -208,6 +208,9 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			)
 		}
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 			reqLog.Warn("openai_chat_completions.account_select_failed",
 				zap.Error(err),
 				zap.Int("excluded_account_count", len(failedAccountIDs)),
@@ -260,6 +263,36 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		writerSizeBeforeForward := c.Writer.Size()
 		var result *service.OpenAIForwardResult
 		var billingRecheckErr error
+		forwardSameAccount := func(ctx context.Context, targetAccount *service.Account) error {
+			for {
+				writerSizeBeforeAttempt := c.Writer.Size()
+				result, err = h.gatewayService.ForwardAsChatCompletions(ctx, c, targetAccount, forwardBody, promptCacheKey, "")
+				if err == nil || (result != nil && result.ImageCount > 0) {
+					return err
+				}
+				var failoverErr *service.UpstreamFailoverError
+				if !errors.As(err, &failoverErr) || c.Writer.Size() != writerSizeBeforeAttempt || !failoverErr.RetryableOnSameAccount {
+					return err
+				}
+				retryLimit := targetAccount.GetPoolModeRetryCount()
+				if sameAccountRetryCount[targetAccount.ID] >= retryLimit {
+					return err
+				}
+				h.gatewayService.ReportOpenAIAccountScheduleResult(targetAccount.ID, false, nil)
+				sameAccountRetryCount[targetAccount.ID]++
+				reqLog.Warn("openai_chat_completions.pool_mode_same_account_retry",
+					zap.Int64("account_id", targetAccount.ID),
+					zap.Int("upstream_status", failoverErr.StatusCode),
+					zap.Int("retry_limit", retryLimit),
+					zap.Int("retry_count", sameAccountRetryCount[targetAccount.ID]),
+				)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(sameAccountRetryDelay):
+				}
+			}
+		}
 		if useExtraAdmission {
 			err = admittedTarget.Dispatch(
 				c.Request.Context(),
@@ -274,15 +307,12 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 					)
 					return billingRecheckErr
 				},
-				func(ctx context.Context, targetAccount *service.Account) error {
-					result, err = h.gatewayService.ForwardAsChatCompletions(ctx, c, targetAccount, forwardBody, promptCacheKey, "")
-					return err
-				},
+				forwardSameAccount,
 			)
 		} else {
-			result, err = func() (*service.OpenAIForwardResult, error) {
+			err = func() error {
 				defer admission.ReleaseAccount()
-				return h.gatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, promptCacheKey, "")
+				return forwardSameAccount(c.Request.Context(), account)
 			}()
 		}
 		if billingRecheckErr != nil {
@@ -292,6 +322,9 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 				c.Header("Retry-After", strconv.Itoa(retryAfter))
 			}
 			h.handleStreamingAwareError(c, status, code, message, streamStarted)
+			return
+		}
+		if c.Request.Context().Err() != nil {
 			return
 		}
 		cyberBlockKeyChat := ""
@@ -325,25 +358,6 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 						return
 					}
 					h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, false, nil)
-					// Pool mode: retry on the same account
-					if failoverErr.RetryableOnSameAccount {
-						retryLimit := account.GetPoolModeRetryCount()
-						if sameAccountRetryCount[account.ID] < retryLimit {
-							sameAccountRetryCount[account.ID]++
-							reqLog.Warn("openai_chat_completions.pool_mode_same_account_retry",
-								zap.Int64("account_id", account.ID),
-								zap.Int("upstream_status", failoverErr.StatusCode),
-								zap.Int("retry_limit", retryLimit),
-								zap.Int("retry_count", sameAccountRetryCount[account.ID]),
-							)
-							select {
-							case <-c.Request.Context().Done():
-								return
-							case <-time.After(sameAccountRetryDelay):
-							}
-							continue
-						}
-					}
 					h.gatewayService.RecordOpenAIAccountSwitch()
 					failedAccountIDs[account.ID] = struct{}{}
 					lastFailoverErr = failoverErr

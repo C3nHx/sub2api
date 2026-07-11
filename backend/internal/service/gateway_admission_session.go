@@ -258,6 +258,9 @@ func (s *GatewayAdmissionSession) NextTarget(ctx context.Context, request Gatewa
 			return nil, gatewayAdmissionTargetWaitError(ctx, class)
 		}
 		if claimErr := claimer.Err(); claimErr != nil {
+			if waitCtx.Err() != nil {
+				return nil, gatewayAdmissionTargetWaitError(ctx, class)
+			}
 			return nil, claimErr
 		}
 		if err != nil {
@@ -308,25 +311,49 @@ func (t *AdmittedTarget) Dispatch(
 	if t == nil || t.Account == nil || t.session == nil {
 		return fmt.Errorf("gateway admission target is unavailable")
 	}
-	if !t.dispatched.CompareAndSwap(false, true) {
-		return fmt.Errorf("gateway admission target was already dispatched")
-	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	defer t.session.ReleaseTarget()
-
-	if t.session.Waited() && recheck != nil {
-		if err := recheck(ctx); err != nil {
-			return err
-		}
+	finish, err := t.BeginAttempt(ctx, recheck)
+	if err != nil {
+		return err
 	}
+	defer finish()
+
 	if upstream == nil {
 		return fmt.Errorf("gateway admission upstream dispatch is unavailable")
 	}
-	stopRenewal := t.session.startRenewal(ctx, t.Account)
-	defer stopRenewal()
 	return upstream(ctx, t.Account)
+}
+
+// BeginAttempt starts one target-bound upstream attempt without releasing the
+// target lease. The returned function stops lease renewal and is idempotent;
+// selecting another target or closing the session owns the actual release.
+func (t *AdmittedTarget) BeginAttempt(
+	ctx context.Context,
+	recheck func(context.Context) error,
+) (func(), error) {
+	if t == nil || t.Account == nil || t.session == nil {
+		return nil, fmt.Errorf("gateway admission target is unavailable")
+	}
+	if !t.dispatched.CompareAndSwap(false, true) {
+		return nil, fmt.Errorf("gateway admission target was already dispatched")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	if t.session.Waited() && recheck != nil {
+		if err := recheck(ctx); err != nil {
+			return nil, err
+		}
+	}
+	stopRenewal := t.session.startRenewal(ctx, t.Account)
+	var once sync.Once
+	return func() {
+		once.Do(stopRenewal)
+	}, nil
 }
 
 func (s *GatewayAdmissionSession) startRenewal(ctx context.Context, account *Account) func() {

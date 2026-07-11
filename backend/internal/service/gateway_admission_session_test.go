@@ -20,6 +20,7 @@ type gatewayAdmissionSessionStoreStub struct {
 	targetRequest      TargetLeaseRequest
 	targetResult       TargetLeaseResult
 	targetBlocked      bool
+	targetWaitForDone  bool
 	targetAttempted    chan struct{}
 	targetAcquireReady chan struct{}
 	targetAcquireStart chan struct{}
@@ -60,8 +61,12 @@ func (s *gatewayAdmissionSessionStoreStub) RenewUserLease(context.Context, int64
 	return true, nil
 }
 
-func (s *gatewayAdmissionSessionStoreStub) TryAcquireTargetLease(_ context.Context, request TargetLeaseRequest) (TargetLeaseResult, error) {
+func (s *gatewayAdmissionSessionStoreStub) TryAcquireTargetLease(ctx context.Context, request TargetLeaseRequest) (TargetLeaseResult, error) {
 	s.targetRequest = request
+	if s.targetWaitForDone {
+		<-ctx.Done()
+		return TargetLeaseResult{}, ctx.Err()
+	}
 	if s.targetAcquireReady != nil {
 		if s.targetAcquireStart != nil {
 			select {
@@ -376,6 +381,54 @@ func TestGatewayAdmissionSessionReturnsExtraTimeoutFromTargetStore(t *testing.T)
 	require.False(t, errors.Is(err, context.DeadlineExceeded))
 }
 
+func TestGatewayAdmissionSessionNormalizesInternalTargetDeadlineForExtraRequest(t *testing.T) {
+	const accountID int64 = 53
+	store := &gatewayAdmissionSessionStoreStub{
+		userResult:        UserLeaseResult{Acquired: true, Class: AdmissionClassExtra},
+		targetWaitForDone: true,
+	}
+	admission := NewGatewayAdmission(
+		store,
+		nil,
+		admissionCapacitySourceFunc(func(context.Context, string) (AdmissionCapacitySnapshot, error) {
+			return AdmissionCapacitySnapshot{
+				TotalConcurrency:   1,
+				AccountConcurrency: map[int64]int{accountID: 1},
+			}, nil
+		}),
+	)
+	session, err := admission.Begin(context.Background(), GatewayAdmissionRequest{
+		UserID:        917,
+		StandardLimit: 1,
+		ExtraLimit:    1,
+		Settings: ExtraConcurrencyRuntimeSettings{
+			WaitTimeoutSeconds: 1,
+		},
+	})
+	require.NoError(t, err)
+	defer session.Close()
+
+	_, err = session.NextTarget(context.Background(), GatewayTargetRequest{
+		Selector: GatewayTargetSelectorFunc(func(ctx context.Context, claimer TargetClaimer) (*AccountSelectionResult, error) {
+			release, acquired, claimErr := claimer.TryClaim(ctx, TargetClaimRequest{
+				Platform:           PlatformGemini,
+				AccountID:          accountID,
+				AccountConcurrency: 1,
+			})
+			return &AccountSelectionResult{
+				Account:     &Account{ID: accountID, Platform: PlatformGemini, Concurrency: 1},
+				Acquired:    acquired,
+				ReleaseFunc: release,
+			}, claimErr
+		}),
+	})
+
+	var unavailable *ExtraConcurrencyUnavailableError
+	require.ErrorAs(t, err, &unavailable)
+	require.True(t, unavailable.Timeout)
+	require.False(t, errors.Is(err, context.DeadlineExceeded))
+}
+
 func TestGatewayAdmissionSessionExtraCapacityFailureStillHonorsWaitTimeout(t *testing.T) {
 	account := Account{
 		ID:          46,
@@ -676,6 +729,34 @@ func TestAdmittedTargetDispatchCanOnlyRunOnce(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, 1, upstreamCalls)
 	require.Equal(t, int32(1), store.targetReleaseCalls.Load())
+}
+
+func TestAdmittedTargetBeginAttemptRenewsUntilFinishedWithoutReleasingTarget(t *testing.T) {
+	target, session, store := newAdmittedTargetForDispatchTest(t)
+	defer session.Close()
+	session.admission.renewInterval = 10 * time.Millisecond
+
+	finish, err := target.BeginAttempt(context.Background(), nil)
+	require.NoError(t, err)
+	require.NotNil(t, finish)
+	require.Eventually(t, func() bool {
+		return store.renewUserCalls.Load() > 0 && store.renewTargetCalls.Load() > 0
+	}, time.Second, 10*time.Millisecond)
+	require.Zero(t, store.targetReleaseCalls.Load())
+
+	finish()
+	finish()
+	userRenewals := store.renewUserCalls.Load()
+	targetRenewals := store.renewTargetCalls.Load()
+	time.Sleep(30 * time.Millisecond)
+	require.Equal(t, userRenewals, store.renewUserCalls.Load())
+	require.Equal(t, targetRenewals, store.renewTargetCalls.Load())
+	require.Zero(t, store.targetReleaseCalls.Load())
+
+	session.ReleaseTarget()
+	require.Equal(t, int32(1), store.targetReleaseCalls.Load())
+	_, err = target.BeginAttempt(context.Background(), nil)
+	require.Error(t, err)
 }
 
 func TestAdmittedTargetDispatchRenewsLeasesWhileUpstreamIsRunning(t *testing.T) {

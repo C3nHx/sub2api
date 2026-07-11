@@ -490,6 +490,7 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 			requestCtx = service.WithAccountSwitchCount(requestCtx, fs.SwitchCount, h.metadataBridgeEnabled())
 		}
 		sessionGroupID := derefGroupID(apiKey.GroupID)
+		writerSizeBeforeForward := c.Writer.Size()
 		forwardAttempt := func(ctx context.Context, targetAccount *service.Account) error {
 			if targetAccount.Platform == service.PlatformAntigravity && targetAccount.Type != service.AccountTypeAPIKey {
 				result, err = h.antigravityGatewayService.ForwardGemini(
@@ -508,6 +509,26 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 			}
 			return err
 		}
+		forwardSameAccount := func(ctx context.Context, targetAccount *service.Account) error {
+			for {
+				writerSizeBeforeAttempt := c.Writer.Size()
+				err = forwardAttempt(ctx, targetAccount)
+				if err == nil {
+					return nil
+				}
+				var failoverErr *service.UpstreamFailoverError
+				if !errors.As(err, &failoverErr) || c.Writer.Size() != writerSizeBeforeAttempt {
+					return err
+				}
+				retry, canceled := fs.TrySameAccountRetry(ctx, targetAccount.ID, failoverErr)
+				if canceled {
+					return ctx.Err()
+				}
+				if !retry {
+					return err
+				}
+			}
+		}
 		var billingRecheckErr error
 		if useExtraAdmission {
 			err = admittedTarget.Dispatch(
@@ -523,10 +544,10 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 					)
 					return billingRecheckErr
 				},
-				forwardAttempt,
+				forwardSameAccount,
 			)
 		} else {
-			err = forwardAttempt(requestCtx, account)
+			err = forwardSameAccount(requestCtx, account)
 			admission.ReleaseAccount()
 		}
 		if billingRecheckErr != nil {
@@ -541,6 +562,9 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 		if err != nil {
 			var failoverErr *service.UpstreamFailoverError
 			if errors.As(err, &failoverErr) {
+				if c.Writer.Size() != writerSizeBeforeForward {
+					return
+				}
 				failoverAction := fs.HandleFailoverError(c.Request.Context(), h.gatewayService, account.ID, account.Platform, failoverErr)
 				switch failoverAction {
 				case FailoverContinue:

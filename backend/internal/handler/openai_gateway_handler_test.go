@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1445,8 +1446,10 @@ func TestOpenAIResponsesWebSocket_FailoverOnUpstreamUsageLimitEvent(t *testing.T
 		nil,
 	)
 
+	var userSlotAcquires atomic.Int32
 	cache := &concurrencyCacheMock{
 		acquireUserSlotFn: func(ctx context.Context, userID int64, maxConcurrency int, requestID string) (bool, error) {
+			userSlotAcquires.Add(1)
 			return true, nil
 		},
 		acquireAccountSlotFn: func(ctx context.Context, accountID int64, maxConcurrency int, requestID string) (bool, error) {
@@ -1509,6 +1512,7 @@ func TestOpenAIResponsesWebSocket_FailoverOnUpstreamUsageLimitEvent(t *testing.T
 	case <-time.After(3 * time.Second):
 		t.Fatal("等待第二个上游收到重放首帧超时")
 	}
+	require.Equal(t, int32(1), userSlotAcquires.Load(), "account failover must retain the user slot")
 	require.Equal(t, []int64{int64(9902)}, accountRepo.rateLimitedIDs)
 }
 

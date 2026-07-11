@@ -111,15 +111,28 @@ func (geminiV1BetaRejectLegacyConcurrencyCache) AcquireUserSlot(context.Context,
 }
 
 type geminiV1BetaExtraUpstream struct {
-	calls    atomic.Int32
-	arrivals chan int64
-	release  <-chan struct{}
+	calls         atomic.Int32
+	arrivals      chan int64
+	namedArrivals chan string
+	release       <-chan struct{}
+	failFirst     bool
 }
 
-func (u *geminiV1BetaExtraUpstream) Do(_ *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
-	u.calls.Add(1)
+func (u *geminiV1BetaExtraUpstream) Do(req *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
+	call := u.calls.Add(1)
 	if u.arrivals != nil {
 		u.arrivals <- accountID
+	}
+	if u.namedArrivals != nil {
+		requestName, _ := req.Context().Value(openAIExtraConcurrencyRequestNameKey{}).(string)
+		u.namedArrivals <- strings.ToUpper(requestName)
+	}
+	if u.failFirst && call == 1 {
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"code":400,"message":"Invalid project resource name","status":"INVALID_ARGUMENT"}}`)),
+		}, nil
 	}
 	if u.release != nil {
 		<-u.release
@@ -325,12 +338,17 @@ func (h *geminiV1BetaExtraRoutesHarness) occupyStandardUserLease(t *testing.T) {
 }
 
 func (h *geminiV1BetaExtraRoutesHarness) request() *httptest.ResponseRecorder {
-	body := []byte(`{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`)
+	return h.requestWithText("hello")
+}
+
+func (h *geminiV1BetaExtraRoutesHarness) requestWithText(text string) *httptest.ResponseRecorder {
+	body := []byte(`{"contents":[{"role":"user","parts":[{"text":"` + text + `"}]}]}`)
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/v1beta/models/gemini-2.5-flash:generateContent",
 		bytes.NewReader(body),
 	)
+	req = req.WithContext(context.WithValue(req.Context(), openAIExtraConcurrencyRequestNameKey{}, strings.TrimPrefix(text, "request-")))
 	req.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 	h.router.ServeHTTP(recorder, req)
@@ -348,6 +366,43 @@ func TestGatewayGeminiV1BetaExtraConcurrencyUsesRealRedisAndReleasesAdmission(t 
 		require.Equal(t, "hello from gemini native", gjson.GetBytes(recorder.Body.Bytes(), "candidates.0.content.parts.0.text").String())
 	}
 	require.Equal(t, int32(2), harness.upstream.calls.Load())
+}
+
+func TestGatewayGeminiV1BetaSameAccountRetryKeepsTargetLease(t *testing.T) {
+	releaseUpstream := make(chan struct{})
+	t.Cleanup(func() { close(releaseUpstream) })
+	upstream := &geminiV1BetaExtraUpstream{
+		namedArrivals: make(chan string, 3),
+		release:       releaseUpstream,
+		failFirst:     true,
+	}
+	harness := newGeminiV1BetaExtraRoutesHarness(t, geminiV1BetaExtraSettingRepository{}, upstream)
+
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	go func() { responses <- harness.requestWithText("request-a") }()
+	require.Equal(t, "A", <-upstream.namedArrivals)
+	go func() { responses <- harness.requestWithText("request-b") }()
+
+	select {
+	case second := <-upstream.namedArrivals:
+		require.Equal(t, "A", second, "same-account retry must run before the waiting request")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the same-account retry")
+	}
+	releaseUpstream <- struct{}{}
+	select {
+	case third := <-upstream.namedArrivals:
+		require.Equal(t, "B", third)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the queued request")
+	}
+	releaseUpstream <- struct{}{}
+
+	firstResponse := <-responses
+	secondResponse := <-responses
+	require.Equal(t, http.StatusOK, firstResponse.Code)
+	require.Equal(t, http.StatusOK, secondResponse.Code)
+	require.Equal(t, int32(3), upstream.calls.Load())
 }
 
 func TestGatewayGeminiV1BetaExtraConcurrencyTimeoutUsesGoogleErrorWithoutUpstream(t *testing.T) {

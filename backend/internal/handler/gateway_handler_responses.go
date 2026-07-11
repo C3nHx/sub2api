@@ -118,19 +118,54 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 
 	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
 
-	admission, err := h.concurrencyHelper.Begin(c, UserAdmissionRequest{
-		UserID:         subject.UserID,
-		MaxConcurrency: subject.Concurrency,
-		Mode:           AdmissionModeWait,
-		Stream:         reqStream,
-		StreamStarted:  &streamStarted,
-	})
+	platform := ""
+	if forcePlatform, ok := middleware2.GetForcePlatformFromContext(c); ok {
+		platform = forcePlatform
+	} else if apiKey.Group != nil {
+		platform = apiKey.Group.Platform
+	}
+
+	extraSettings := service.ExtraConcurrencyRuntimeSettings{}
+	useExtraAdmission := false
+	if (platform == service.PlatformAnthropic || platform == service.PlatformGemini || platform == service.PlatformAntigravity) && h.gatewayAdmission != nil && h.settingService != nil {
+		extraSettings = h.settingService.GetExtraConcurrencyRuntimeSettings(requestCtx)
+		useExtraAdmission = extraSettings.Enabled
+	}
+
+	var (
+		admission      *RequestAdmission
+		extraAdmission *service.GatewayAdmissionSession
+	)
+	if useExtraAdmission {
+		extraAdmission, err = h.gatewayAdmission.Begin(requestCtx, service.GatewayAdmissionRequest{
+			UserID:        subject.UserID,
+			StandardLimit: subject.Concurrency,
+			ExtraLimit:    subject.ExtraConcurrency,
+			Settings:      extraSettings,
+		})
+		if err == nil {
+			release := h.concurrencyHelper.withAPIKeySlotFromGin(c, extraAdmission.Close)
+			release = wrapReleaseOnDone(c.Request.Context(), release)
+			defer release()
+		}
+	} else {
+		// Feature-off compatibility is structural: retain the legacy helper path.
+		admission, err = h.concurrencyHelper.Begin(c, UserAdmissionRequest{
+			UserID:         subject.UserID,
+			MaxConcurrency: subject.Concurrency,
+			Mode:           AdmissionModeWait,
+			Stream:         reqStream,
+			StreamStarted:  &streamStarted,
+		})
+		if err == nil {
+			defer admission.Close()
+		}
+	}
 	if err != nil {
 		reqLog.Warn("gateway.responses.user_slot_acquire_failed", zap.Error(err))
-		h.handleConcurrencyError(c, err, "user", streamStarted)
+		h.handleResponsesConcurrencyError(c, err, "user", streamStarted)
 		return
 	}
-	defer admission.Close()
 
 	// 2. Re-check billing
 	if err := h.billingCacheService.CheckBillingEligibility(requestCtx, apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(requestCtx, apiKey)); err != nil {
@@ -160,8 +195,30 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 	fs := NewFailoverState(h.maxAccountSwitches, false)
 
 	for {
-		selection, err := h.gatewayService.SelectAccountWithLoadAwareness(requestCtx, apiKey.GroupID, sessionHash, reqModel, fs.FailedAccountIDs, "", int64(0))
+		var (
+			selection      *service.AccountSelectionResult
+			admittedTarget *service.AdmittedTarget
+		)
+		if useExtraAdmission {
+			admittedTarget, err = extraAdmission.NextTarget(requestCtx, service.GatewayTargetRequest{
+				GroupID:            apiKey.GroupID,
+				SessionKey:         sessionHash,
+				Model:              reqModel,
+				MetadataUserID:     parsedReq.MetadataUserID,
+				ExcludedAccountIDs: fs.FailedAccountIDs,
+			})
+		} else {
+			selection, err = h.gatewayService.SelectAccountWithLoadAwareness(requestCtx, apiKey.GroupID, sessionHash, reqModel, fs.FailedAccountIDs, "", int64(0))
+		}
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			if useExtraAdmission && isGatewayAdmissionConcurrencyError(err) {
+				reqLog.Warn("gateway.responses.extra_admission_failed", zap.Error(err))
+				h.handleResponsesConcurrencyError(c, err, "account", streamStarted)
+				return
+			}
 			if len(fs.FailedAccountIDs) == 0 {
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, service.PlatformAnthropic)
 				if !cls.ModelNotFound {
@@ -189,23 +246,30 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 				return
 			}
 		}
-		account := selection.Account
+		var account *service.Account
+		if useExtraAdmission {
+			account = admittedTarget.Account
+		} else {
+			account = selection.Account
+		}
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
-		// 4. Acquire account concurrency slot
-		if err := admission.AdmitAccount(AccountAdmissionRequest{
-			Selection:  selection,
-			WaitPolicy: AccountWaitPolicyUntracked,
-		}); err != nil {
-			var unavailableErr *AccountUnavailableError
-			if errors.As(err, &unavailableErr) {
-				markOpsRoutingCapacityLimited(c)
-				h.responsesErrorResponse(c, http.StatusServiceUnavailable, "api_error", "No available accounts")
+		// 4. Acquire account concurrency slot. NextTarget owns it on the new path.
+		if !useExtraAdmission {
+			if err := admission.AdmitAccount(AccountAdmissionRequest{
+				Selection:  selection,
+				WaitPolicy: AccountWaitPolicyUntracked,
+			}); err != nil {
+				var unavailableErr *AccountUnavailableError
+				if errors.As(err, &unavailableErr) {
+					markOpsRoutingCapacityLimited(c)
+					h.responsesErrorResponse(c, http.StatusServiceUnavailable, "api_error", "No available accounts")
+					return
+				}
+				reqLog.Warn("gateway.responses.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+				h.handleResponsesConcurrencyError(c, err, "account", streamStarted)
 				return
 			}
-			reqLog.Warn("gateway.responses.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
-			h.handleConcurrencyError(c, err, "account", streamStarted)
-			return
 		}
 
 		// 5. Forward request
@@ -214,9 +278,64 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		if channelMapping.Mapped {
 			forwardBody = h.gatewayService.ReplaceModelInBody(body, channelMapping.MappedModel)
 		}
-		result, err := h.gatewayService.ForwardAsResponses(requestCtx, c, account, forwardBody, parsedReq)
-
-		admission.ReleaseAccount()
+		var result *service.ForwardResult
+		sameAccountRetryCanceled := false
+		forwardSameAccount := func(ctx context.Context, targetAccount *service.Account) error {
+			for {
+				writerSizeBeforeAttempt := c.Writer.Size()
+				result, err = h.gatewayService.ForwardAsResponses(ctx, c, targetAccount, forwardBody, parsedReq)
+				if err == nil {
+					return nil
+				}
+				var failoverErr *service.UpstreamFailoverError
+				if !errors.As(err, &failoverErr) || c.Writer.Size() != writerSizeBeforeAttempt {
+					return err
+				}
+				retry, canceled := fs.TrySameAccountRetry(ctx, targetAccount.ID, failoverErr)
+				if canceled {
+					sameAccountRetryCanceled = true
+					return ctx.Err()
+				}
+				if !retry {
+					return err
+				}
+			}
+		}
+		var billingRecheckErr error
+		if useExtraAdmission {
+			err = admittedTarget.Dispatch(
+				requestCtx,
+				func(ctx context.Context) error {
+					billingRecheckErr = h.billingCacheService.RecheckBillingEligibility(
+						ctx,
+						apiKey.User,
+						apiKey,
+						apiKey.Group,
+						subscription,
+						service.QuotaPlatform(ctx, apiKey),
+					)
+					return billingRecheckErr
+				},
+				forwardSameAccount,
+			)
+		} else {
+			err = func() error {
+				defer admission.ReleaseAccount()
+				return forwardSameAccount(requestCtx, account)
+			}()
+		}
+		if sameAccountRetryCanceled || requestCtx.Err() != nil {
+			return
+		}
+		if billingRecheckErr != nil {
+			reqLog.Info("gateway.responses.billing_eligibility_recheck_failed", zap.Error(billingRecheckErr))
+			status, code, message, retryAfter := billingErrorDetails(billingRecheckErr)
+			if retryAfter > 0 {
+				c.Header("Retry-After", strconv.Itoa(retryAfter))
+			}
+			h.responsesErrorResponse(c, status, code, message)
+			return
+		}
 
 		if err != nil {
 			var failoverErr *service.UpstreamFailoverError
@@ -293,6 +412,15 @@ func (h *GatewayHandler) responsesErrorResponse(c *gin.Context, status int, code
 			"message": message,
 		},
 	})
+}
+
+func (h *GatewayHandler) handleResponsesConcurrencyError(c *gin.Context, err error, slotType string, streamStarted bool) {
+	status, code, message := concurrencyErrorResponse(err, slotType)
+	if streamStarted {
+		h.handleStreamingAwareError(c, status, code, message, true)
+		return
+	}
+	h.responsesErrorResponse(c, status, code, message)
 }
 
 // handleResponsesFailoverExhausted writes a failover-exhausted error in Responses format.

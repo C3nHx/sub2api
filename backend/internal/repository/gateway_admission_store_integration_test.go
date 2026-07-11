@@ -3,6 +3,7 @@
 package repository
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -10,6 +11,134 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/stretchr/testify/require"
 )
+
+type gatewayAdmissionIntegrationCapacity struct {
+	accountID int64
+}
+
+func (c gatewayAdmissionIntegrationCapacity) AdmissionCapacity(context.Context, string) (service.AdmissionCapacitySnapshot, error) {
+	return service.AdmissionCapacitySnapshot{
+		TotalConcurrency: 1,
+		AccountConcurrency: map[int64]int{
+			c.accountID: 1,
+		},
+	}, nil
+}
+
+func beginRedisBackedAdmissionTarget(
+	t *testing.T,
+	ctx context.Context,
+	leaseTTL time.Duration,
+	userID int64,
+	accountID int64,
+) (service.GatewayAdmissionStore, *service.GatewayAdmissionSession, *service.AdmittedTarget) {
+	t.Helper()
+
+	store := NewGatewayAdmissionStore(testRedis(t), leaseTTL)
+	admission := service.NewGatewayAdmission(
+		store,
+		nil,
+		gatewayAdmissionIntegrationCapacity{accountID: accountID},
+	)
+	session, err := admission.Begin(ctx, service.GatewayAdmissionRequest{
+		UserID:        userID,
+		StandardLimit: 1,
+		ExtraLimit:    1,
+		Settings: service.ExtraConcurrencyRuntimeSettings{
+			WaitTimeoutSeconds: 2,
+		},
+	})
+	require.NoError(t, err)
+
+	account := &service.Account{
+		ID:          accountID,
+		Platform:    service.PlatformAnthropic,
+		Concurrency: 1,
+	}
+	target, err := session.NextTarget(ctx, service.GatewayTargetRequest{
+		Selector: service.GatewayTargetSelectorFunc(func(ctx context.Context, claimer service.TargetClaimer) (*service.AccountSelectionResult, error) {
+			release, claimed, claimErr := claimer.TryClaim(ctx, service.TargetClaimRequest{
+				Platform:           account.Platform,
+				AccountID:          account.ID,
+				AccountConcurrency: account.Concurrency,
+			})
+			if claimErr != nil {
+				return nil, claimErr
+			}
+			return &service.AccountSelectionResult{
+				Account:     account,
+				Acquired:    claimed,
+				ReleaseFunc: release,
+			}, nil
+		}),
+	})
+	require.NoError(t, err)
+	return store, session, target
+}
+
+func acquireCompetingAdmission(
+	t *testing.T,
+	store service.GatewayAdmissionStore,
+	requestID string,
+	userID int64,
+	accountID int64,
+) (service.UserLeaseResult, service.TargetLeaseResult) {
+	t.Helper()
+
+	userLease, err := store.TryAcquireUserLease(t.Context(), service.UserLeaseRequest{
+		RequestID:     requestID,
+		UserID:        userID,
+		StandardLimit: 1,
+		ExtraLimit:    0,
+		MaxWaiting:    1,
+		WaitTimeout:   2 * time.Second,
+	})
+	require.NoError(t, err)
+
+	targetLease, err := store.TryAcquireTargetLease(t.Context(), service.TargetLeaseRequest{
+		RequestID:        requestID,
+		Platform:         service.PlatformAnthropic,
+		AccountID:        accountID,
+		AccountLimit:     1,
+		PlatformCapacity: 1,
+		Class:            service.AdmissionClassStandard,
+		WaitTimeout:      2 * time.Second,
+	})
+	require.NoError(t, err)
+	return userLease, targetLease
+}
+
+func assertCompetingAdmissionBlocked(
+	t *testing.T,
+	store service.GatewayAdmissionStore,
+	requestID string,
+	userID int64,
+	accountID int64,
+) {
+	t.Helper()
+	userLease, targetLease := acquireCompetingAdmission(t, store, requestID, userID, accountID)
+	require.False(t, userLease.Acquired)
+	require.False(t, targetLease.Acquired)
+}
+
+func assertCompetingAdmissionAcquired(
+	t *testing.T,
+	store service.GatewayAdmissionStore,
+	requestID string,
+	userID int64,
+	accountID int64,
+) {
+	t.Helper()
+	userLease, targetLease := acquireCompetingAdmission(t, store, requestID, userID, accountID)
+	require.True(t, userLease.Acquired)
+	require.Equal(t, service.AdmissionClassStandard, userLease.Class)
+	require.True(t, targetLease.Acquired)
+
+	t.Cleanup(func() {
+		_ = store.ReleaseTargetLease(context.Background(), service.PlatformAnthropic, accountID, requestID)
+		_ = store.ReleaseUserLease(context.Background(), userID, requestID)
+	})
+}
 
 func TestGatewayAdmissionStoreAllocatesStandardBeforeExtraAcrossInstances(t *testing.T) {
 	rdb := testRedis(t)
@@ -307,6 +436,123 @@ func TestGatewayAdmissionStoreRenewKeepsUserAndTargetLeasesAlive(t *testing.T) {
 	competingLease, err := store.TryAcquireTargetLease(t.Context(), competingTarget)
 	require.NoError(t, err)
 	require.False(t, competingLease.Acquired)
+}
+
+func TestGatewayAdmissionDispatchAutomaticallyRenewsRedisLeasesUntilCompletion(t *testing.T) {
+	const (
+		userID    int64 = 901
+		accountID int64 = 801
+	)
+	store, session, target := beginRedisBackedAdmissionTarget(
+		t,
+		t.Context(),
+		300*time.Millisecond,
+		userID,
+		accountID,
+	)
+	t.Cleanup(session.Close)
+
+	upstreamStarted := make(chan struct{})
+	finishUpstream := make(chan struct{}, 1)
+	t.Cleanup(func() {
+		select {
+		case finishUpstream <- struct{}{}:
+		default:
+		}
+	})
+	dispatchDone := make(chan error, 1)
+	go func() {
+		dispatchDone <- target.Dispatch(
+			t.Context(),
+			nil,
+			func(context.Context, *service.Account) error {
+				close(upstreamStarted)
+				<-finishUpstream
+				return nil
+			},
+		)
+	}()
+	<-upstreamStarted
+
+	// The shared account lease has second-level compatibility TTL semantics.
+	// Holding past one second ensures a non-renewing implementation would have
+	// expired every user, platform, and account lease before this assertion.
+	time.Sleep(1500 * time.Millisecond)
+	assertCompetingAdmissionBlocked(t, store, "dispatch-competitor", userID, accountID)
+
+	finishUpstream <- struct{}{}
+	require.NoError(t, <-dispatchDone)
+	session.Close()
+	session.Close()
+
+	assertCompetingAdmissionAcquired(t, store, "dispatch-competitor", userID, accountID)
+}
+
+func TestGatewayAdmissionContextCancellationReleasesHeldRedisLeasesIdempotently(t *testing.T) {
+	const (
+		userID    int64 = 902
+		accountID int64 = 802
+	)
+	requestCtx, cancelRequest := context.WithCancel(t.Context())
+	store, session, target := beginRedisBackedAdmissionTarget(
+		t,
+		requestCtx,
+		300*time.Millisecond,
+		userID,
+		accountID,
+	)
+	t.Cleanup(session.Close)
+
+	upstreamStarted := make(chan struct{})
+	dispatchDone := make(chan error, 1)
+	go func() {
+		dispatchDone <- target.Dispatch(
+			requestCtx,
+			nil,
+			func(ctx context.Context, _ *service.Account) error {
+				close(upstreamStarted)
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		)
+	}()
+	<-upstreamStarted
+
+	cancelRequest()
+	require.ErrorIs(t, <-dispatchDone, context.Canceled)
+	session.Close()
+	session.Close()
+
+	assertCompetingAdmissionAcquired(t, store, "cancel-competitor", userID, accountID)
+}
+
+func TestGatewayAdmissionUpstreamErrorReleasesHeldRedisLeasesIdempotently(t *testing.T) {
+	const (
+		userID    int64 = 903
+		accountID int64 = 803
+	)
+	store, session, target := beginRedisBackedAdmissionTarget(
+		t,
+		t.Context(),
+		300*time.Millisecond,
+		userID,
+		accountID,
+	)
+	t.Cleanup(session.Close)
+
+	upstreamErr := fmt.Errorf("upstream stream read failed")
+	err := target.Dispatch(
+		t.Context(),
+		nil,
+		func(context.Context, *service.Account) error {
+			return upstreamErr
+		},
+	)
+	require.ErrorIs(t, err, upstreamErr)
+	session.Close()
+	session.Close()
+
+	assertCompetingAdmissionAcquired(t, store, "error-competitor", userID, accountID)
 }
 
 func TestGatewayAdmissionStoreUserLeaseContentionAcrossRedisClients(t *testing.T) {

@@ -469,6 +469,28 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				}
 				return err
 			}
+			sameAccountRetryCanceled := false
+			forwardSameAccount := func(ctx context.Context, targetAccount *service.Account) error {
+				for {
+					writerSizeBeforeAttempt := c.Writer.Size()
+					err = forwardAttempt(ctx, targetAccount)
+					if err == nil {
+						return nil
+					}
+					var failoverErr *service.UpstreamFailoverError
+					if !errors.As(err, &failoverErr) || c.Writer.Size() != writerSizeBeforeAttempt {
+						return err
+					}
+					retry, canceled := fs.TrySameAccountRetry(ctx, targetAccount.ID, failoverErr)
+					if canceled {
+						sameAccountRetryCanceled = true
+						return ctx.Err()
+					}
+					if !retry {
+						return err
+					}
+				}
+			}
 			var billingRecheckErr error
 			if useExtraAdmission {
 				err = admittedTarget.Dispatch(
@@ -484,11 +506,14 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 						)
 						return billingRecheckErr
 					},
-					forwardAttempt,
+					forwardSameAccount,
 				)
 			} else {
-				err = forwardAttempt(requestCtx, account)
+				err = forwardSameAccount(requestCtx, account)
 				admission.ReleaseAccount()
+			}
+			if sameAccountRetryCanceled {
+				return
 			}
 			if billingRecheckErr != nil {
 				reqLog.Info("gateway.billing_eligibility_recheck_failed", zap.Error(billingRecheckErr))
@@ -818,8 +843,6 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 
 			// 用 wrapReleaseOnDone 确保 context 取消时自动释放（仅 serialize 模式有 queueRelease）
 			queueRelease = wrapReleaseOnDone(c.Request.Context(), queueRelease)
-			// 注入回调到 ParsedRequest：使用外层 wrapper 以便提前清理 AfterFunc
-			attemptParsedReq.OnUpstreamAccepted = queueRelease
 			// ===== 用户消息串行队列 END =====
 
 			// 渠道模型映射只作用于本次账号尝试，避免 failover 后污染原始 ParsedRequest。
@@ -835,10 +858,10 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
 				return
 			}
-			attemptBody := attemptParsedReq.Body.Bytes()
+			attemptTemplate := attemptParsedReq
+			attemptTemplateBody := append([]byte(nil), attemptParsedReq.Body.Bytes()...)
 
 			// 转发请求 - 根据账号平台分流
-			c.Set("parsed_request", attemptParsedReq)
 			var result *service.ForwardResult
 			requestCtx := c.Request.Context()
 			if fs.SwitchCount > 0 {
@@ -847,12 +870,42 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			// 记录 Forward 前已写入字节数，Forward 后若增加则说明 SSE 内容已发，禁止 failover
 			writerSizeBeforeForward := c.Writer.Size()
 			forwardAttempt := func(ctx context.Context, targetAccount *service.Account) error {
+				attemptParsedReq, err = attemptTemplate.CloneForBody(attemptTemplateBody)
+				if err != nil {
+					return err
+				}
+				attemptParsedReq.OnUpstreamAccepted = queueRelease
+				c.Set("parsed_request", attemptParsedReq)
+				attemptBody := attemptParsedReq.Body.Bytes()
 				if targetAccount.Platform == service.PlatformAntigravity && targetAccount.Type != service.AccountTypeAPIKey {
 					result, err = h.antigravityGatewayService.Forward(ctx, c, targetAccount, attemptBody, hasBoundSession)
 				} else {
 					result, err = h.gatewayService.Forward(ctx, c, targetAccount, attemptParsedReq)
 				}
+				attemptParsedReq.OnUpstreamAccepted = nil
 				return err
+			}
+			sameAccountRetryCanceled := false
+			forwardSameAccount := func(ctx context.Context, targetAccount *service.Account) error {
+				for {
+					writerSizeBeforeAttempt := c.Writer.Size()
+					err = forwardAttempt(ctx, targetAccount)
+					if err == nil {
+						return nil
+					}
+					var failoverErr *service.UpstreamFailoverError
+					if !errors.As(err, &failoverErr) || c.Writer.Size() != writerSizeBeforeAttempt {
+						return err
+					}
+					retry, canceled := fs.TrySameAccountRetry(ctx, targetAccount.ID, failoverErr)
+					if canceled {
+						sameAccountRetryCanceled = true
+						return ctx.Err()
+					}
+					if !retry {
+						return err
+					}
+				}
 			}
 			var billingRecheckErr error
 			if useExtraAdmission {
@@ -869,10 +922,10 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 						)
 						return billingRecheckErr
 					},
-					forwardAttempt,
+					forwardSameAccount,
 				)
 			} else {
-				err = forwardAttempt(requestCtx, account)
+				err = forwardSameAccount(requestCtx, account)
 			}
 
 			// 兜底释放串行锁（正常情况已通过回调提前释放）
@@ -884,6 +937,9 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 
 			if !useExtraAdmission {
 				admission.ReleaseAccount()
+			}
+			if sameAccountRetryCanceled {
+				return
 			}
 			if billingRecheckErr != nil {
 				reqLog.Info("gateway.billing_eligibility_recheck_failed", zap.Error(billingRecheckErr))

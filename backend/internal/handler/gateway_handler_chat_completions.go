@@ -106,22 +106,55 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 	}
 
 	subscription, _ := middleware2.GetSubscriptionFromContext(c)
+	groupPlatform := ""
+	if forcePlatform, ok := middleware2.GetForcePlatformFromContext(c); ok {
+		groupPlatform = forcePlatform
+	} else if apiKey.Group != nil {
+		groupPlatform = apiKey.Group.Platform
+	}
 
 	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
 
-	admission, err := h.concurrencyHelper.Begin(c, UserAdmissionRequest{
-		UserID:         subject.UserID,
-		MaxConcurrency: subject.Concurrency,
-		Mode:           AdmissionModeWait,
-		Stream:         reqStream,
-		StreamStarted:  &streamStarted,
-	})
+	extraSettings := service.ExtraConcurrencyRuntimeSettings{}
+	useExtraAdmission := false
+	if (groupPlatform == service.PlatformAnthropic || groupPlatform == service.PlatformGemini || groupPlatform == service.PlatformAntigravity) && h.gatewayAdmission != nil && h.settingService != nil {
+		extraSettings = h.settingService.GetExtraConcurrencyRuntimeSettings(c.Request.Context())
+		useExtraAdmission = extraSettings.Enabled
+	}
+
+	var (
+		admission      *RequestAdmission
+		extraAdmission *service.GatewayAdmissionSession
+	)
+	if useExtraAdmission {
+		extraAdmission, err = h.gatewayAdmission.Begin(c.Request.Context(), service.GatewayAdmissionRequest{
+			UserID:        subject.UserID,
+			StandardLimit: subject.Concurrency,
+			ExtraLimit:    subject.ExtraConcurrency,
+			Settings:      extraSettings,
+		})
+		if err == nil {
+			release := h.concurrencyHelper.withAPIKeySlotFromGin(c, extraAdmission.Close)
+			release = wrapReleaseOnDone(c.Request.Context(), release)
+			defer release()
+		}
+	} else {
+		admission, err = h.concurrencyHelper.Begin(c, UserAdmissionRequest{
+			UserID:         subject.UserID,
+			MaxConcurrency: subject.Concurrency,
+			Mode:           AdmissionModeWait,
+			Stream:         reqStream,
+			StreamStarted:  &streamStarted,
+		})
+		if err == nil {
+			defer admission.Close()
+		}
+	}
 	if err != nil {
 		reqLog.Warn("gateway.cc.user_slot_acquire_failed", zap.Error(err))
-		h.handleConcurrencyError(c, err, "user", streamStarted)
+		h.handleCCConcurrencyError(c, err, "user", streamStarted)
 		return
 	}
-	defer admission.Close()
 
 	// 2. Re-check billing
 	if err := h.billingCacheService.CheckBillingEligibility(c.Request.Context(), apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(c.Request.Context(), apiKey)); err != nil {
@@ -146,10 +179,6 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		APIKeyID:  apiKey.ID,
 	}
 	sessionHash := h.gatewayService.GenerateSessionHash(parsedReq)
-	groupPlatform := ""
-	if apiKey.Group != nil {
-		groupPlatform = apiKey.Group.Platform
-	}
 	selectionSessionHash := sessionHash
 	if groupPlatform == service.PlatformGemini && selectionSessionHash != "" {
 		selectionSessionHash = "gemini:" + selectionSessionHash
@@ -162,8 +191,29 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 	}
 
 	for {
-		selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, selectionSessionHash, reqModel, fs.FailedAccountIDs, "", int64(0))
+		var (
+			selection      *service.AccountSelectionResult
+			admittedTarget *service.AdmittedTarget
+		)
+		if useExtraAdmission {
+			admittedTarget, err = extraAdmission.NextTarget(c.Request.Context(), service.GatewayTargetRequest{
+				GroupID:            apiKey.GroupID,
+				SessionKey:         selectionSessionHash,
+				Model:              reqModel,
+				ExcludedAccountIDs: fs.FailedAccountIDs,
+			})
+		} else {
+			selection, err = h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, selectionSessionHash, reqModel, fs.FailedAccountIDs, "", int64(0))
+		}
 		if err != nil {
+			if useExtraAdmission && errors.Is(err, context.Canceled) {
+				return
+			}
+			if useExtraAdmission && isGatewayAdmissionConcurrencyError(err) {
+				reqLog.Warn("gateway.cc.extra_admission_failed", zap.Error(err))
+				h.handleCCConcurrencyError(c, err, "account", streamStarted)
+				return
+			}
 			if len(fs.FailedAccountIDs) == 0 {
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, groupPlatform)
 				if !cls.ModelNotFound {
@@ -191,29 +241,49 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 				return
 			}
 		}
-		account := selection.Account
+		var account *service.Account
+		if useExtraAdmission {
+			account = admittedTarget.Account
+		} else {
+			account = selection.Account
+		}
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
 		// 4. Acquire account concurrency slot
-		if err := admission.AdmitAccount(AccountAdmissionRequest{
-			Selection:  selection,
-			WaitPolicy: AccountWaitPolicyUntracked,
-		}); err != nil {
-			var unavailableErr *AccountUnavailableError
-			if errors.As(err, &unavailableErr) {
-				markOpsRoutingCapacityLimited(c)
-				h.chatCompletionsErrorResponse(c, http.StatusServiceUnavailable, "api_error", "No available accounts")
+		if !useExtraAdmission {
+			if err := admission.AdmitAccount(AccountAdmissionRequest{
+				Selection:  selection,
+				WaitPolicy: AccountWaitPolicyUntracked,
+			}); err != nil {
+				var unavailableErr *AccountUnavailableError
+				if errors.As(err, &unavailableErr) {
+					markOpsRoutingCapacityLimited(c)
+					h.chatCompletionsErrorResponse(c, http.StatusServiceUnavailable, "api_error", "No available accounts")
+					return
+				}
+				reqLog.Warn("gateway.cc.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+				h.handleCCConcurrencyError(c, err, "account", streamStarted)
 				return
 			}
-			reqLog.Warn("gateway.cc.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
-			h.handleConcurrencyError(c, err, "account", streamStarted)
-			return
 		}
 
 		if groupPlatform == service.PlatformGemini && account.Platform != service.PlatformGemini {
-			admission.ReleaseAccount()
+			if useExtraAdmission {
+				extraAdmission.ReleaseTarget()
+			} else {
+				admission.ReleaseAccount()
+			}
 			fs.FailedAccountIDs[account.ID] = struct{}{}
 			continue
+		}
+		if account.Platform == service.PlatformGemini && h.geminiCompatService == nil {
+			if useExtraAdmission {
+				extraAdmission.ReleaseTarget()
+			} else {
+				admission.ReleaseAccount()
+			}
+			h.chatCompletionsErrorResponse(c, http.StatusBadGateway, "upstream_error", "Gemini compatibility service is not configured")
+			return
 		}
 
 		// 5. Forward request
@@ -223,18 +293,69 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 			forwardBody = h.gatewayService.ReplaceModelInBody(body, channelMapping.MappedModel)
 		}
 		var result *service.ForwardResult
-		if account.Platform == service.PlatformGemini {
-			if h.geminiCompatService == nil {
-				h.chatCompletionsErrorResponse(c, http.StatusBadGateway, "upstream_error", "Gemini compatibility service is not configured")
-				admission.ReleaseAccount()
-				return
+		var billingRecheckErr error
+		forward := func(ctx context.Context, targetAccount *service.Account) error {
+			if targetAccount.Platform == service.PlatformGemini {
+				result, err = h.geminiCompatService.ForwardAsChatCompletions(ctx, c, targetAccount, forwardBody)
+			} else {
+				result, err = h.gatewayService.ForwardAsChatCompletions(ctx, c, targetAccount, forwardBody, parsedReq)
 			}
-			result, err = h.geminiCompatService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody)
-		} else {
-			result, err = h.gatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, parsedReq)
+			return err
 		}
-
-		admission.ReleaseAccount()
+		sameAccountRetryCanceled := false
+		forwardSameAccount := func(ctx context.Context, targetAccount *service.Account) error {
+			for {
+				writerSizeBeforeAttempt := c.Writer.Size()
+				attemptErr := forward(ctx, targetAccount)
+				if attemptErr == nil {
+					return nil
+				}
+				var failoverErr *service.UpstreamFailoverError
+				if !errors.As(attemptErr, &failoverErr) || c.Writer.Size() != writerSizeBeforeAttempt {
+					return attemptErr
+				}
+				retry, canceled := fs.TrySameAccountRetry(ctx, targetAccount.ID, failoverErr)
+				if canceled {
+					sameAccountRetryCanceled = true
+					return ctx.Err()
+				}
+				if !retry {
+					return attemptErr
+				}
+			}
+		}
+		if useExtraAdmission {
+			err = admittedTarget.Dispatch(
+				c.Request.Context(),
+				func(ctx context.Context) error {
+					billingRecheckErr = h.billingCacheService.RecheckBillingEligibility(
+						ctx,
+						apiKey.User,
+						apiKey,
+						apiKey.Group,
+						subscription,
+						service.QuotaPlatform(ctx, apiKey),
+					)
+					return billingRecheckErr
+				},
+				forwardSameAccount,
+			)
+		} else {
+			err = forward(c.Request.Context(), account)
+			admission.ReleaseAccount()
+		}
+		if billingRecheckErr != nil {
+			reqLog.Info("gateway.cc.billing_recheck_failed", zap.Error(billingRecheckErr))
+			status, code, message, retryAfter := billingErrorDetails(billingRecheckErr)
+			if retryAfter > 0 {
+				c.Header("Retry-After", strconv.Itoa(retryAfter))
+			}
+			h.chatCompletionsErrorResponse(c, status, code, message)
+			return
+		}
+		if sameAccountRetryCanceled || (useExtraAdmission && errors.Is(err, context.Canceled)) {
+			return
+		}
 
 		if err != nil {
 			var failoverErr *service.UpstreamFailoverError
@@ -310,6 +431,15 @@ func (h *GatewayHandler) chatCompletionsErrorResponse(c *gin.Context, status int
 			"message": message,
 		},
 	})
+}
+
+func (h *GatewayHandler) handleCCConcurrencyError(c *gin.Context, err error, slotType string, streamStarted bool) {
+	status, errType, message := concurrencyErrorResponse(err, slotType)
+	if streamStarted {
+		h.handleStreamingAwareError(c, status, errType, message, true)
+		return
+	}
+	h.chatCompletionsErrorResponse(c, status, errType, message)
 }
 
 // handleCCFailoverExhausted writes a failover-exhausted error in CC format.
