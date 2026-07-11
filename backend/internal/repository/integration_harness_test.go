@@ -234,6 +234,14 @@ func testEntSQLTx(t *testing.T) (*dbent.Client, *sql.Tx) {
 
 func testRedis(t *testing.T) *redisclient.Client {
 	t.Helper()
+	return testRedisClients(t, 1)[0]
+}
+
+func testRedisClients(t *testing.T, count int) []*redisclient.Client {
+	t.Helper()
+	if count < 1 {
+		t.Fatalf("redis client count must be positive")
+	}
 
 	prefix := fmt.Sprintf(
 		"it:%s:%d:%d:",
@@ -242,9 +250,13 @@ func testRedis(t *testing.T) *redisclient.Client {
 		atomic.AddUint64(&redisNamespaceSeq, 1),
 	)
 
-	opts := *integrationRedis.Options()
-	rdb := redisclient.NewClient(&opts)
-	rdb.AddHook(prefixHook{prefix: prefix})
+	clients := make([]*redisclient.Client, 0, count)
+	for range count {
+		opts := *integrationRedis.Options()
+		rdb := redisclient.NewClient(&opts)
+		rdb.AddHook(prefixHook{prefix: prefix})
+		clients = append(clients, rdb)
+	}
 
 	t.Cleanup(func() {
 		ctx := context.Background()
@@ -263,10 +275,12 @@ func testRedis(t *testing.T) *redisclient.Client {
 			}
 		}
 
-		_ = rdb.Close()
+		for _, rdb := range clients {
+			_ = rdb.Close()
+		}
 	})
 
-	return rdb
+	return clients
 }
 
 func assertTTLWithin(t *testing.T, ttl time.Duration, min, max time.Duration) {

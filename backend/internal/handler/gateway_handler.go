@@ -49,6 +49,7 @@ type GatewayHandler struct {
 	errorPassthroughService   *service.ErrorPassthroughService
 	contentModerationService  *service.ContentModerationService
 	concurrencyHelper         *ConcurrencyHelper
+	gatewayAdmission          *service.GatewayAdmission
 	userMsgQueueHelper        *UserMsgQueueHelper
 	maxAccountSwitches        int
 	maxAccountSwitchesGemini  int
@@ -63,6 +64,7 @@ func NewGatewayHandler(
 	antigravityGatewayService *service.AntigravityGatewayService,
 	userService *service.UserService,
 	concurrencyService *service.ConcurrencyService,
+	gatewayAdmission *service.GatewayAdmission,
 	billingCacheService *service.BillingCacheService,
 	usageService *service.UsageService,
 	apiKeyService *service.APIKeyService,
@@ -104,6 +106,7 @@ func NewGatewayHandler(
 		errorPassthroughService:   errorPassthroughService,
 		contentModerationService:  contentModerationService,
 		concurrencyHelper:         NewConcurrencyHelper(concurrencyService, SSEPingFormatClaude, pingInterval),
+		gatewayAdmission:          gatewayAdmission,
 		userMsgQueueHelper:        umqHelper,
 		maxAccountSwitches:        maxAccountSwitches,
 		maxAccountSwitchesGemini:  maxAccountSwitchesGemini,
@@ -212,20 +215,55 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 	// 获取订阅信息（可能为nil）- 提前获取用于后续检查
 	subscription, _ := middleware2.GetSubscriptionFromContext(c)
 
-	// 1. 首先获取用户并发槽位
-	admission, err := h.concurrencyHelper.Begin(c, UserAdmissionRequest{
-		UserID:         subject.UserID,
-		MaxConcurrency: subject.Concurrency,
-		Mode:           AdmissionModeWait,
-		Stream:         reqStream,
-		StreamStarted:  &streamStarted,
-	})
+	// 获取平台：优先使用强制平台（/antigravity 路由，中间件已设置 request.Context），否则使用分组平台
+	platform := ""
+	if forcePlatform, ok := middleware2.GetForcePlatformFromContext(c); ok {
+		platform = forcePlatform
+	} else if apiKey.Group != nil {
+		platform = apiKey.Group.Platform
+	}
+
+	extraSettings := service.ExtraConcurrencyRuntimeSettings{}
+	useExtraAdmission := false
+	if platform == service.PlatformAnthropic && h.gatewayAdmission != nil && h.settingService != nil {
+		extraSettings = h.settingService.GetExtraConcurrencyRuntimeSettings(c.Request.Context())
+		useExtraAdmission = extraSettings.Enabled
+	}
+
+	var (
+		admission      *RequestAdmission
+		extraAdmission *service.GatewayAdmissionSession
+	)
+	if useExtraAdmission {
+		extraAdmission, err = h.gatewayAdmission.Begin(c.Request.Context(), service.GatewayAdmissionRequest{
+			UserID:        subject.UserID,
+			StandardLimit: subject.Concurrency,
+			ExtraLimit:    subject.ExtraConcurrency,
+			Settings:      extraSettings,
+		})
+		if err == nil {
+			release := h.concurrencyHelper.withAPIKeySlotFromGin(c, extraAdmission.Close)
+			release = wrapReleaseOnDone(c.Request.Context(), release)
+			defer release()
+		}
+	} else {
+		// Feature-off compatibility is structural: retain the legacy helper path.
+		admission, err = h.concurrencyHelper.Begin(c, UserAdmissionRequest{
+			UserID:         subject.UserID,
+			MaxConcurrency: subject.Concurrency,
+			Mode:           AdmissionModeWait,
+			Stream:         reqStream,
+			StreamStarted:  &streamStarted,
+		})
+		if err == nil {
+			defer admission.Close()
+		}
+	}
 	if err != nil {
 		reqLog.Warn("gateway.user_slot_acquire_failed", zap.Error(err))
 		h.handleConcurrencyError(c, err, "user", streamStarted)
 		return
 	}
-	defer admission.Close()
 
 	// 2. 【新增】Wait后二次检查余额/订阅
 	if err := h.billingCacheService.CheckBillingEligibility(c.Request.Context(), apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(c.Request.Context(), apiKey)); err != nil {
@@ -255,13 +293,6 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		zap.String("metadata_user_id_raw", parsedReq.MetadataUserID),
 	)
 
-	// 获取平台：优先使用强制平台（/antigravity 路由，中间件已设置 request.Context），否则使用分组平台
-	platform := ""
-	if forcePlatform, ok := middleware2.GetForcePlatformFromContext(c); ok {
-		platform = forcePlatform
-	} else if apiKey.Group != nil {
-		platform = apiKey.Group.Platform
-	}
 	sessionKey := sessionHash
 	if platform == service.PlatformGemini && sessionHash != "" {
 		sessionKey = "gemini:" + sessionHash
@@ -346,7 +377,9 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			if account.IsInterceptWarmupEnabled() {
 				interceptType := detectInterceptType(body, reqModel, parsedReq.MaxTokens, isClaudeCodeClient)
 				if interceptType != InterceptTypeNone {
-					if selection.Acquired && selection.ReleaseFunc != nil {
+					if useExtraAdmission {
+						extraAdmission.ReleaseTarget()
+					} else if selection.Acquired && selection.ReleaseFunc != nil {
 						selection.ReleaseFunc()
 					}
 					if reqStream {
@@ -553,8 +586,31 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				zap.Bool("has_bound_session", hasBoundSession),
 				zap.Int("failed_account_count", len(fs.FailedAccountIDs)),
 			)
-			selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), currentAPIKey.GroupID, sessionKey, reqModel, fs.FailedAccountIDs, parsedReq.MetadataUserID, subject.UserID)
+			var (
+				selection      *service.AccountSelectionResult
+				admittedTarget *service.AdmittedTarget
+			)
+			if useExtraAdmission {
+				admittedTarget, err = extraAdmission.NextTarget(c.Request.Context(), service.GatewayTargetRequest{
+					GroupID:            currentAPIKey.GroupID,
+					SessionKey:         sessionKey,
+					Model:              reqModel,
+					MetadataUserID:     parsedReq.MetadataUserID,
+					ExcludedAccountIDs: fs.FailedAccountIDs,
+				})
+			} else {
+				selection, err = h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), currentAPIKey.GroupID, sessionKey, reqModel, fs.FailedAccountIDs, parsedReq.MetadataUserID, subject.UserID)
+			}
 			if err != nil {
+				if useExtraAdmission {
+					var extraUnavailable *service.ExtraConcurrencyUnavailableError
+					var queueFull *service.GatewayAdmissionQueueFullError
+					if errors.As(err, &extraUnavailable) || errors.As(err, &queueFull) || errors.Is(err, context.Canceled) {
+						reqLog.Warn("gateway.extra_admission_failed", zap.Error(err))
+						h.handleConcurrencyError(c, err, "account", streamStarted)
+						return
+					}
+				}
 				if len(fs.FailedAccountIDs) == 0 {
 					cls := classifyNoAccountErrorFromGin(c, h.gatewayService, currentAPIKey, reqModel, reqModel, platform)
 					if !cls.ModelNotFound {
@@ -592,15 +648,20 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					return
 				}
 			}
-			account := selection.Account
+			var account *service.Account
+			if useExtraAdmission {
+				account = admittedTarget.Account
+			} else {
+				account = selection.Account
+			}
 			setOpsSelectedAccount(c, account.ID, account.Platform)
 
 			// [DEBUG-STICKY] 打印账号选择结果
 			reqLog.Info("sticky.account_selected",
 				zap.Int64("selected_account_id", account.ID),
 				zap.String("account_name", account.Name),
-				zap.Bool("slot_acquired", selection.Acquired),
-				zap.Bool("has_wait_plan", selection.WaitPlan != nil),
+				zap.Bool("slot_acquired", useExtraAdmission || selection.Acquired),
+				zap.Bool("has_wait_plan", !useExtraAdmission && selection.WaitPlan != nil),
 				zap.Int64("sticky_bound_account_id", sessionBoundAccountID),
 				zap.Bool("sticky_honored", sessionBoundAccountID > 0 && sessionBoundAccountID == account.ID),
 			)
@@ -609,7 +670,9 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			if account.IsInterceptWarmupEnabled() {
 				interceptType := detectInterceptType(body, reqModel, parsedReq.MaxTokens, isClaudeCodeClient)
 				if interceptType != InterceptTypeNone {
-					if selection.Acquired && selection.ReleaseFunc != nil {
+					if useExtraAdmission {
+						extraAdmission.ReleaseTarget()
+					} else if selection.Acquired && selection.ReleaseFunc != nil {
 						selection.ReleaseFunc()
 					}
 					if reqStream {
@@ -621,34 +684,36 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				}
 			}
 
-			// 3. 获取账号并发槽位
-			waitedForAccount := !selection.Acquired
-			if err := admission.AdmitAccount(AccountAdmissionRequest{
-				Selection:  selection,
-				WaitPolicy: AccountWaitPolicyTracked,
-			}); err != nil {
-				var unavailableErr *AccountUnavailableError
-				if errors.As(err, &unavailableErr) {
-					markOpsRoutingCapacityLimited(c)
-					reqLog.Warn("gateway.select_account_no_slot_no_wait_plan",
-						zap.Int64("account_id", account.ID),
-						zap.String("model", reqModel),
-						zap.String("platform", platform),
-					)
-					h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", "No available accounts", streamStarted)
+			// 3. 获取账号并发槽位。新路径已在 NextTarget 中原子持有目标租约。
+			if !useExtraAdmission {
+				waitedForAccount := !selection.Acquired
+				if err := admission.AdmitAccount(AccountAdmissionRequest{
+					Selection:  selection,
+					WaitPolicy: AccountWaitPolicyTracked,
+				}); err != nil {
+					var unavailableErr *AccountUnavailableError
+					if errors.As(err, &unavailableErr) {
+						markOpsRoutingCapacityLimited(c)
+						reqLog.Warn("gateway.select_account_no_slot_no_wait_plan",
+							zap.Int64("account_id", account.ID),
+							zap.String("model", reqModel),
+							zap.String("platform", platform),
+						)
+						h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", "No available accounts", streamStarted)
+						return
+					}
+					reqLog.Warn("gateway.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+					h.handleConcurrencyError(c, err, "account", streamStarted)
 					return
 				}
-				reqLog.Warn("gateway.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
-				h.handleConcurrencyError(c, err, "account", streamStarted)
-				return
-			}
-			if waitedForAccount {
-				reqLog.Info("sticky.bind_after_wait",
-					zap.String("session_key", sessionKey),
-					zap.Int64("account_id", account.ID),
-				)
-				if err := h.gatewayService.BindStickySession(c.Request.Context(), currentAPIKey.GroupID, sessionKey, account.ID); err != nil {
-					reqLog.Warn("gateway.bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+				if waitedForAccount {
+					reqLog.Info("sticky.bind_after_wait",
+						zap.String("session_key", sessionKey),
+						zap.Int64("account_id", account.ID),
+					)
+					if err := h.gatewayService.BindStickySession(c.Request.Context(), currentAPIKey.GroupID, sessionKey, account.ID); err != nil {
+						reqLog.Warn("gateway.bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+					}
 				}
 			}
 
@@ -728,10 +793,33 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			}
 			// 记录 Forward 前已写入字节数，Forward 后若增加则说明 SSE 内容已发，禁止 failover
 			writerSizeBeforeForward := c.Writer.Size()
-			if account.Platform == service.PlatformAntigravity && account.Type != service.AccountTypeAPIKey {
-				result, err = h.antigravityGatewayService.Forward(requestCtx, c, account, attemptBody, hasBoundSession)
+			forwardAttempt := func(ctx context.Context, targetAccount *service.Account) error {
+				if targetAccount.Platform == service.PlatformAntigravity && targetAccount.Type != service.AccountTypeAPIKey {
+					result, err = h.antigravityGatewayService.Forward(ctx, c, targetAccount, attemptBody, hasBoundSession)
+				} else {
+					result, err = h.gatewayService.Forward(ctx, c, targetAccount, attemptParsedReq)
+				}
+				return err
+			}
+			var billingRecheckErr error
+			if useExtraAdmission {
+				err = admittedTarget.Dispatch(
+					requestCtx,
+					func(ctx context.Context) error {
+						billingRecheckErr = h.billingCacheService.RecheckBillingEligibility(
+							ctx,
+							currentAPIKey.User,
+							currentAPIKey,
+							currentAPIKey.Group,
+							currentSubscription,
+							service.QuotaPlatform(ctx, currentAPIKey),
+						)
+						return billingRecheckErr
+					},
+					forwardAttempt,
+				)
 			} else {
-				result, err = h.gatewayService.Forward(requestCtx, c, account, attemptParsedReq)
+				err = forwardAttempt(requestCtx, account)
 			}
 
 			// 兜底释放串行锁（正常情况已通过回调提前释放）
@@ -741,7 +829,18 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			// 清理回调引用，防止 failover 重试时旧回调被错误调用
 			attemptParsedReq.OnUpstreamAccepted = nil
 
-			admission.ReleaseAccount()
+			if !useExtraAdmission {
+				admission.ReleaseAccount()
+			}
+			if billingRecheckErr != nil {
+				reqLog.Info("gateway.billing_eligibility_recheck_failed", zap.Error(billingRecheckErr))
+				status, code, message, retryAfter := billingErrorDetails(billingRecheckErr)
+				if retryAfter > 0 {
+					c.Header("Retry-After", strconv.Itoa(retryAfter))
+				}
+				h.handleStreamingAwareError(c, status, code, message, streamStarted)
+				return
+			}
 			if err != nil {
 				// Beta policy block: return 400 immediately, no failover
 				var betaBlockedErr *service.BetaBlockedError
