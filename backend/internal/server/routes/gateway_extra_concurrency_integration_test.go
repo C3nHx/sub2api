@@ -5,11 +5,13 @@ package routes
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,6 +25,7 @@ import (
 	servermiddleware "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
@@ -120,6 +123,7 @@ type extraConcurrencySettingRepository struct {
 	reservePercent     float64
 	minReservedSlots   int
 	disabled           bool
+	disabledFlag       *atomic.Bool
 }
 
 func (extraConcurrencySettingRepository) Get(context.Context, string) (*service.Setting, error) {
@@ -134,8 +138,12 @@ func (r extraConcurrencySettingRepository) GetMultiple(context.Context, []string
 	if waitTimeoutSeconds <= 0 {
 		waitTimeoutSeconds = 1
 	}
+	disabled := r.disabled
+	if r.disabledFlag != nil {
+		disabled = r.disabledFlag.Load()
+	}
 	enabled := "true"
-	if r.disabled {
+	if disabled {
 		enabled = "false"
 	}
 	return map[string]string{
@@ -267,6 +275,63 @@ func (u *blockingOpenAIExtraConcurrencyUpstream) DoWithTLS(req *http.Request, pr
 	return u.Do(req, proxyURL, accountID, accountConcurrency)
 }
 
+type namedBlockingOpenAIExtraConcurrencyUpstream struct {
+	arrivals chan string
+	releases map[string]<-chan struct{}
+	calls    atomic.Int32
+}
+
+func (u *namedBlockingOpenAIExtraConcurrencyUpstream) Do(req *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
+	requestName, _ := req.Context().Value(openAIExtraConcurrencyRequestNameKey{}).(string)
+	requestName = strings.ToUpper(requestName)
+	u.calls.Add(1)
+	u.arrivals <- requestName
+	if release := u.releases[requestName]; release != nil {
+		<-release
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"id":"resp_emergency_order","object":"response","status":"completed","model":"gpt-5.1","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`,
+		)),
+	}, nil
+}
+
+func (u *namedBlockingOpenAIExtraConcurrencyUpstream) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	return u.Do(req, proxyURL, accountID, accountConcurrency)
+}
+
+type cancellationAwareOpenAIExtraConcurrencyUpstream struct {
+	arrivals chan int64
+	release  <-chan struct{}
+	canceled chan error
+	calls    atomic.Int32
+}
+
+func (u *cancellationAwareOpenAIExtraConcurrencyUpstream) Do(req *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
+	u.calls.Add(1)
+	u.arrivals <- accountID
+	select {
+	case <-u.release:
+	case <-req.Context().Done():
+		err := req.Context().Err()
+		u.canceled <- err
+		return nil, err
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"id":"resp_emergency","object":"response","status":"completed","model":"gpt-5.1","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`,
+		)),
+	}, nil
+}
+
+func (u *cancellationAwareOpenAIExtraConcurrencyUpstream) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	return u.Do(req, proxyURL, accountID, accountConcurrency)
+}
+
 type retryingOpenAIExtraConcurrencyUpstream struct {
 	arrivals chan string
 	release  <-chan struct{}
@@ -304,12 +369,23 @@ type observedOpenAITargetLeaseRelease struct {
 
 type observingOpenAIGatewayAdmissionStore struct {
 	service.GatewayAdmissionStore
-	userAttempts                chan observedOpenAIUserLeaseAttempt
-	targetAttempts              chan observedOpenAITargetLeaseAttempt
-	targetReleases              chan observedOpenAITargetLeaseRelease
-	targetReleaseBarrier        <-chan struct{}
-	targetReleaseBarrierRequest string
-	targetReleaseBarrierAccount int64
+	userAttempts                 chan observedOpenAIUserLeaseAttempt
+	targetAttempts               chan observedOpenAITargetLeaseAttempt
+	targetReleases               chan observedOpenAITargetLeaseRelease
+	targetReleaseBarrier         <-chan struct{}
+	targetReleaseBarrierRequest  string
+	targetReleaseBarrierAccount  int64
+	targetAttemptBarrier         <-chan struct{}
+	targetAttemptBarrierRequest  string
+	targetAttemptBarrierAccount  int64
+	targetAttemptBarrierEntered  chan<- struct{}
+	targetAcquiredBarrier        <-chan struct{}
+	targetAcquiredBarrierRequest string
+	targetAcquiredBarrierAccount int64
+	targetAcquiredBarrierEntered chan<- struct{}
+	userAttemptBarrier           <-chan struct{}
+	userAttemptBarrierRequest    string
+	userAttemptBarrierExtra      int
 }
 
 func newObservingOpenAIGatewayAdmissionStore(store service.GatewayAdmissionStore) *observingOpenAIGatewayAdmissionStore {
@@ -325,13 +401,20 @@ func (s *observingOpenAIGatewayAdmissionStore) TryAcquireUserLease(ctx context.C
 	result, err := s.GatewayAdmissionStore.TryAcquireUserLease(ctx, request)
 	if err == nil {
 		requestName, _ := ctx.Value(openAIExtraConcurrencyRequestNameKey{}).(string)
+		requestName = strings.ToUpper(requestName)
 		select {
 		case s.userAttempts <- observedOpenAIUserLeaseAttempt{
-			requestName: strings.ToUpper(requestName),
+			requestName: requestName,
 			request:     request,
 			result:      result,
 		}:
 		default:
+		}
+		if requestName == s.userAttemptBarrierRequest && request.ExtraLimit == s.userAttemptBarrierExtra && s.userAttemptBarrier != nil {
+			select {
+			case <-s.userAttemptBarrier:
+			case <-ctx.Done():
+			}
 		}
 	}
 	return result, err
@@ -357,16 +440,38 @@ func (s *observingOpenAIGatewayAdmissionStore) ReleaseTargetLease(ctx context.Co
 }
 
 func (s *observingOpenAIGatewayAdmissionStore) TryAcquireTargetLease(ctx context.Context, request service.TargetLeaseRequest) (service.TargetLeaseResult, error) {
+	requestName, _ := ctx.Value(openAIExtraConcurrencyRequestNameKey{}).(string)
+	requestName = strings.ToUpper(requestName)
+	if requestName == s.targetAttemptBarrierRequest && request.AccountID == s.targetAttemptBarrierAccount && s.targetAttemptBarrier != nil {
+		select {
+		case s.targetAttemptBarrierEntered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-s.targetAttemptBarrier:
+		case <-ctx.Done():
+		}
+	}
 	result, err := s.GatewayAdmissionStore.TryAcquireTargetLease(ctx, request)
 	if err == nil {
-		requestName, _ := ctx.Value(openAIExtraConcurrencyRequestNameKey{}).(string)
 		select {
 		case s.targetAttempts <- observedOpenAITargetLeaseAttempt{
-			requestName: strings.ToUpper(requestName),
+			requestName: requestName,
 			request:     request,
 			result:      result,
 		}:
 		default:
+		}
+		if result.Acquired && requestName == s.targetAcquiredBarrierRequest &&
+			request.AccountID == s.targetAcquiredBarrierAccount && s.targetAcquiredBarrier != nil {
+			select {
+			case s.targetAcquiredBarrierEntered <- struct{}{}:
+			default:
+			}
+			select {
+			case <-s.targetAcquiredBarrier:
+			case <-ctx.Done():
+			}
 		}
 	}
 	return result, err
@@ -548,11 +653,37 @@ func requireOpenAIExtraConcurrencyHTTPResponse(t *testing.T, responses <-chan *h
 	}
 }
 
+func closeChannelOnCleanup(t *testing.T, channel chan struct{}) func() {
+	t.Helper()
+	var once sync.Once
+	closeChannel := func() { once.Do(func() { close(channel) }) }
+	t.Cleanup(closeChannel)
+	return closeChannel
+}
+
+func openAIEmergencyExtraConcurrencyAccount(name string) []service.Account {
+	return []service.Account{{
+		ID:          1301,
+		Name:        name,
+		Platform:    service.PlatformOpenAI,
+		Type:        service.AccountTypeAPIKey,
+		Concurrency: 1,
+		Status:      service.StatusActive,
+		Schedulable: true,
+		Credentials: map[string]any{"api_key": "sk-emergency", "base_url": "https://api.openai.com"},
+		Extra:       map[string]any{"openai_passthrough": true},
+		GroupIDs:    []int64{2301},
+	}}
+}
+
 type openAIExtraConcurrencyRoutesHarness struct {
-	router   *gin.Engine
-	store    service.GatewayAdmissionStore
-	observer *observingOpenAIGatewayAdmissionStore
-	userID   int64
+	router            *gin.Engine
+	rdb               *redis.Client
+	store             service.GatewayAdmissionStore
+	observer          *observingOpenAIGatewayAdmissionStore
+	legacyConcurrency *service.ConcurrencyService
+	settingService    *service.SettingService
+	userID            int64
 }
 
 func newOpenAIExtraConcurrencyRoutesHarness(
@@ -669,6 +800,7 @@ func newOpenAIExtraConcurrencyRoutesHarnessWithLoadBatch(
 		nil,
 		openAIExtraConcurrencyCapacity{accountConcurrency: accountConcurrency},
 	)
+	admission.SetExtraConcurrencyRuntimeSettingsSource(settingService)
 	openAIHandler := handler.NewOpenAIGatewayHandler(
 		openAIService,
 		legacyConcurrency,
@@ -734,10 +866,13 @@ func newOpenAIExtraConcurrencyRoutesHarnessWithLoadBatch(
 		openAIHandler.Messages(c)
 	})
 	return &openAIExtraConcurrencyRoutesHarness{
-		router:   router,
-		store:    admissionStore,
-		observer: observingAdmissionStore,
-		userID:   userID,
+		router:            router,
+		rdb:               rdb,
+		store:             admissionStore,
+		observer:          observingAdmissionStore,
+		legacyConcurrency: legacyConcurrency,
+		settingService:    settingService,
+		userID:            userID,
 	}
 }
 
@@ -1652,6 +1787,459 @@ func TestOpenAIChatCompletionsExtraConcurrencyTimeoutUsesRealRedisWithoutUpstrea
 	require.Equal(t, http.StatusTooManyRequests, recorder.Code)
 	require.Contains(t, recorder.Body.String(), "EXTRA_CONCURRENCY_UNAVAILABLE")
 	require.Zero(t, upstream.calls.Load())
+}
+
+func TestOpenAIResponsesEmergencyDisableRequeuesUndispatchedExtraWithOriginalArrival(t *testing.T) {
+	disabled := &atomic.Bool{}
+	releaseUpstream := make(chan struct{})
+	upstream := &blockingOpenAIExtraConcurrencyUpstream{
+		arrivals: make(chan int64, 1),
+		release:  releaseUpstream,
+	}
+	harness := newOpenAIExtraConcurrencyRoutesHarness(
+		t,
+		extraConcurrencySettingRepository{waitTimeoutSeconds: 3, disabledFlag: disabled},
+		upstream,
+		nil,
+		openAIEmergencyExtraConcurrencyAccount("openai-extra-emergency"),
+	)
+	releaseUpstreamNow := closeChannelOnCleanup(t, releaseUpstream)
+	targetAttemptBarrier := make(chan struct{})
+	releaseTargetAttemptBarrier := closeChannelOnCleanup(t, targetAttemptBarrier)
+	targetAttemptEntered := make(chan struct{}, 1)
+	harness.observer.targetAttemptBarrier = targetAttemptBarrier
+	harness.observer.targetAttemptBarrierRequest = "EARLIER"
+	harness.observer.targetAttemptBarrierAccount = 1301
+	harness.observer.targetAttemptBarrierEntered = targetAttemptEntered
+
+	standardBlocker := service.UserLeaseRequest{
+		RequestID:     "emergency-active-standard",
+		UserID:        harness.userID,
+		StandardLimit: 1,
+		ExtraLimit:    1,
+		MaxWaiting:    20,
+		WaitTimeout:   3 * time.Second,
+	}
+	standard, err := harness.store.TryAcquireUserLease(t.Context(), standardBlocker)
+	require.NoError(t, err)
+	require.True(t, standard.Acquired)
+	require.Equal(t, service.AdmissionClassStandard, standard.Class)
+	t.Cleanup(func() {
+		_ = harness.store.ReleaseUserLease(context.Background(), harness.userID, standardBlocker.RequestID)
+	})
+
+	responses := make(chan *httptest.ResponseRecorder, 1)
+	go func() { responses <- harness.responsesRequest("request-earlier") }()
+	earlier := requireObservedOpenAIUserLeaseAttempt(t, harness.observer.userAttempts, "EARLIER", true)
+	require.Equal(t, service.AdmissionClassExtra, earlier.result.Class)
+	select {
+	case <-targetAttemptEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the earlier request to select its target")
+	}
+	targetBlocker := service.TargetLeaseRequest{
+		RequestID:        "emergency-active-target",
+		Platform:         service.PlatformOpenAI,
+		AccountID:        1301,
+		AccountLimit:     1,
+		PlatformCapacity: 1,
+		Class:            service.AdmissionClassStandard,
+		WaitTimeout:      3 * time.Second,
+	}
+	target, err := harness.store.TryAcquireTargetLease(t.Context(), targetBlocker)
+	require.NoError(t, err)
+	require.True(t, target.Acquired)
+	t.Cleanup(func() {
+		_ = harness.store.ReleaseTargetLease(context.Background(), targetBlocker.Platform, targetBlocker.AccountID, targetBlocker.RequestID)
+	})
+	releaseTargetAttemptBarrier()
+	requireObservedOpenAITargetLeaseAttempt(t, harness.observer.targetAttempts, "EARLIER", 1301, false)
+
+	laterStandard := service.UserLeaseRequest{
+		RequestID:     "emergency-later-standard",
+		UserID:        harness.userID,
+		StandardLimit: 1,
+		ExtraLimit:    0,
+		MaxWaiting:    20,
+		WaitTimeout:   3 * time.Second,
+	}
+	later, err := harness.store.TryAcquireUserLease(t.Context(), laterStandard)
+	require.NoError(t, err)
+	require.False(t, later.Acquired)
+	t.Cleanup(func() {
+		_ = harness.store.ReleaseUserLease(context.Background(), harness.userID, laterStandard.RequestID)
+	})
+
+	fallbackBarrier := make(chan struct{})
+	releaseFallbackBarrier := closeChannelOnCleanup(t, fallbackBarrier)
+	harness.observer.userAttemptBarrier = fallbackBarrier
+	harness.observer.userAttemptBarrierRequest = "EARLIER"
+	harness.observer.userAttemptBarrierExtra = 0
+	disabled.Store(true)
+	harness.settingService.InvalidateExtraConcurrencyRuntimeSettings()
+
+	converted := requireObservedOpenAIUserLeaseAttempt(t, harness.observer.userAttempts, "EARLIER", false)
+	require.Equal(t, earlier.request.RequestID, converted.request.RequestID)
+	require.Zero(t, converted.request.ExtraLimit)
+
+	require.NoError(t, harness.store.ReleaseUserLease(t.Context(), harness.userID, standardBlocker.RequestID))
+	later, err = harness.store.TryAcquireUserLease(t.Context(), laterStandard)
+	require.NoError(t, err)
+	require.False(t, later.Acquired, "later standard waiter must remain behind the converted earlier request")
+	releaseFallbackBarrier()
+
+	promoted := requireObservedOpenAIUserLeaseAttempt(t, harness.observer.userAttempts, "EARLIER", true)
+	require.Equal(t, service.AdmissionClassStandard, promoted.result.Class)
+	require.NoError(t, harness.store.ReleaseTargetLease(t.Context(), targetBlocker.Platform, targetBlocker.AccountID, targetBlocker.RequestID))
+	requireObservedOpenAITargetLeaseAttempt(t, harness.observer.targetAttempts, "EARLIER", 1301, true)
+	select {
+	case <-upstream.arrivals:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for converted request to dispatch upstream")
+	}
+	releaseUpstreamNow()
+
+	response := requireOpenAIExtraConcurrencyHTTPResponse(t, responses, "EARLIER")
+	require.Equal(t, http.StatusOK, response.Code)
+}
+
+func TestOpenAIResponsesEmergencyDisableReleasesExtraTargetBeforeWaitingForStandard(t *testing.T) {
+	disabled := &atomic.Bool{}
+	releaseStandard := make(chan struct{})
+	releaseExtra := make(chan struct{})
+	releaseStandardNow := closeChannelOnCleanup(t, releaseStandard)
+	releaseExtraNow := closeChannelOnCleanup(t, releaseExtra)
+	upstream := &namedBlockingOpenAIExtraConcurrencyUpstream{
+		arrivals: make(chan string, 2),
+		releases: map[string]<-chan struct{}{
+			"STANDARD": releaseStandard,
+			"EXTRA":    releaseExtra,
+		},
+	}
+	harness := newOpenAIExtraConcurrencyRoutesHarness(
+		t,
+		extraConcurrencySettingRepository{waitTimeoutSeconds: 3, disabledFlag: disabled},
+		upstream,
+		nil,
+		openAIEmergencyExtraConcurrencyAccount("openai-extra-retarget"),
+	)
+
+	targetAcquiredBarrier := make(chan struct{})
+	releaseTargetAcquiredBarrier := closeChannelOnCleanup(t, targetAcquiredBarrier)
+	targetAcquired := make(chan struct{}, 1)
+	harness.observer.targetAcquiredBarrier = targetAcquiredBarrier
+	harness.observer.targetAcquiredBarrierRequest = "EXTRA"
+	harness.observer.targetAcquiredBarrierAccount = 1301
+	harness.observer.targetAcquiredBarrierEntered = targetAcquired
+
+	standardBlocker := service.UserLeaseRequest{
+		RequestID:     "retarget-standard-blocker",
+		UserID:        harness.userID,
+		StandardLimit: 1,
+		ExtraLimit:    1,
+		MaxWaiting:    20,
+		WaitTimeout:   3 * time.Second,
+	}
+	standard, err := harness.store.TryAcquireUserLease(t.Context(), standardBlocker)
+	require.NoError(t, err)
+	require.True(t, standard.Acquired)
+	require.Equal(t, service.AdmissionClassStandard, standard.Class)
+	t.Cleanup(func() {
+		_ = harness.store.ReleaseUserLease(context.Background(), harness.userID, standardBlocker.RequestID)
+	})
+
+	extraResponses := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		extraResponses <- harness.responsesRequestForUser("request-extra", harness.userID, 1, 1)
+	}()
+	extraLease := requireObservedOpenAIUserLeaseAttempt(t, harness.observer.userAttempts, "EXTRA", true)
+	require.Equal(t, service.AdmissionClassExtra, extraLease.result.Class)
+	select {
+	case <-targetAcquired:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the extra request to hold the target")
+	}
+
+	require.NoError(t, harness.store.ReleaseUserLease(t.Context(), harness.userID, standardBlocker.RequestID))
+	standardResponses := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		standardResponses <- harness.responsesRequestForUser("request-standard", harness.userID, 1, 0)
+	}()
+	standardLease := requireObservedOpenAIUserLeaseAttempt(t, harness.observer.userAttempts, "STANDARD", true)
+	require.Equal(t, service.AdmissionClassStandard, standardLease.result.Class)
+	requireObservedOpenAITargetLeaseAttempt(t, harness.observer.targetAttempts, "STANDARD", 1301, false)
+
+	disabled.Store(true)
+	harness.settingService.InvalidateExtraConcurrencyRuntimeSettings()
+	require.False(t, harness.settingService.GetExtraConcurrencyRuntimeSettings(t.Context()).Enabled)
+	releaseTargetAcquiredBarrier()
+
+	select {
+	case requestName := <-upstream.arrivals:
+		require.Equal(t, "STANDARD", requestName,
+			"the standard request must receive the target before the converted extra request")
+	case <-time.After(3 * time.Second):
+		t.Fatal("standard request remained deadlocked behind the extra-to-standard fallback")
+	}
+	releaseStandardNow()
+	standardResponse := requireOpenAIExtraConcurrencyHTTPResponse(t, standardResponses, "standard request")
+	require.Equal(t, http.StatusOK, standardResponse.Code)
+
+	select {
+	case requestName := <-upstream.arrivals:
+		require.Equal(t, "EXTRA", requestName)
+	case <-time.After(3 * time.Second):
+		t.Fatal("converted extra request did not reacquire the target after standard completed")
+	}
+	releaseExtraNow()
+	extraResponse := requireOpenAIExtraConcurrencyHTTPResponse(t, extraResponses, "converted extra request")
+	require.Equal(t, http.StatusOK, extraResponse.Code)
+	require.Equal(t, int32(2), upstream.calls.Load())
+}
+
+func TestOpenAIResponsesEmergencyDisableLetsDispatchedExtraFinish(t *testing.T) {
+	disabled := &atomic.Bool{}
+	releaseUpstream := make(chan struct{})
+	upstream := &cancellationAwareOpenAIExtraConcurrencyUpstream{
+		arrivals: make(chan int64, 1),
+		release:  releaseUpstream,
+		canceled: make(chan error, 1),
+	}
+	harness := newOpenAIExtraConcurrencyRoutesHarness(
+		t,
+		extraConcurrencySettingRepository{waitTimeoutSeconds: 3, disabledFlag: disabled},
+		upstream,
+		nil,
+		openAIEmergencyExtraConcurrencyAccount("openai-extra-inflight"),
+	)
+	releaseUpstreamNow := closeChannelOnCleanup(t, releaseUpstream)
+
+	standardBlocker := service.UserLeaseRequest{
+		RequestID:     "inflight-active-standard",
+		UserID:        harness.userID,
+		StandardLimit: 1,
+		ExtraLimit:    1,
+		MaxWaiting:    20,
+		WaitTimeout:   3 * time.Second,
+	}
+	standard, err := harness.store.TryAcquireUserLease(t.Context(), standardBlocker)
+	require.NoError(t, err)
+	require.True(t, standard.Acquired)
+	require.Equal(t, service.AdmissionClassStandard, standard.Class)
+	t.Cleanup(func() {
+		_ = harness.store.ReleaseUserLease(context.Background(), harness.userID, standardBlocker.RequestID)
+	})
+
+	responses := make(chan *httptest.ResponseRecorder, 1)
+	go func() { responses <- harness.responsesRequest("request-inflight") }()
+	inflight := requireObservedOpenAIUserLeaseAttempt(t, harness.observer.userAttempts, "INFLIGHT", true)
+	require.Equal(t, service.AdmissionClassExtra, inflight.result.Class)
+	requireObservedOpenAITargetLeaseAttempt(t, harness.observer.targetAttempts, "INFLIGHT", 1301, true)
+	select {
+	case <-upstream.arrivals:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the extra request to dispatch upstream")
+	}
+
+	disabled.Store(true)
+	harness.settingService.InvalidateExtraConcurrencyRuntimeSettings()
+	select {
+	case err := <-upstream.canceled:
+		t.Fatalf("dispatched upstream request was canceled after emergency disable: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	releaseUpstreamNow()
+
+	response := requireOpenAIExtraConcurrencyHTTPResponse(t, responses, "INFLIGHT")
+	require.Equal(t, http.StatusOK, response.Code)
+	require.Contains(t, response.Body.String(), `"id":"resp_emergency"`)
+	require.Equal(t, int32(1), upstream.calls.Load())
+	select {
+	case err := <-upstream.canceled:
+		t.Fatalf("dispatched upstream request was canceled while completing: %v", err)
+	default:
+	}
+}
+
+func TestOpenAIResponsesEmergencyDisableDrainsGatewayUserStateBeforeLegacy(t *testing.T) {
+	disabled := &atomic.Bool{}
+	releaseUpstream := make(chan struct{})
+	upstream := &blockingOpenAIExtraConcurrencyUpstream{
+		arrivals: make(chan int64, 1),
+		release:  releaseUpstream,
+	}
+	harness := newOpenAIExtraConcurrencyRoutesHarness(
+		t,
+		extraConcurrencySettingRepository{waitTimeoutSeconds: 3, disabledFlag: disabled},
+		upstream,
+		nil,
+		openAIEmergencyExtraConcurrencyAccount("openai-extra-drain"),
+	)
+	releaseUpstreamNow := closeChannelOnCleanup(t, releaseUpstream)
+
+	secondRedis := redis.NewClient(harness.rdb.Options())
+	require.NoError(t, secondRedis.Ping(t.Context()).Err())
+	t.Cleanup(func() { _ = secondRedis.Close() })
+	secondStore := repository.NewGatewayAdmissionStore(secondRedis, 30*time.Second)
+
+	standardRequest := service.UserLeaseRequest{
+		RequestID:     "drain-active-standard",
+		UserID:        harness.userID,
+		StandardLimit: 1,
+		ExtraLimit:    1,
+		MaxWaiting:    20,
+		WaitTimeout:   3 * time.Second,
+	}
+	standard, err := secondStore.TryAcquireUserLease(t.Context(), standardRequest)
+	require.NoError(t, err)
+	require.True(t, standard.Acquired)
+	require.Equal(t, service.AdmissionClassStandard, standard.Class)
+
+	extraRequest := standardRequest
+	extraRequest.RequestID = "drain-active-extra"
+	extra, err := secondStore.TryAcquireUserLease(t.Context(), extraRequest)
+	require.NoError(t, err)
+	require.True(t, extra.Acquired)
+	require.Equal(t, service.AdmissionClassExtra, extra.Class)
+
+	earlierRequest := standardRequest
+	earlierRequest.RequestID = "drain-earlier-standard-waiter"
+	earlierRequest.ExtraLimit = 0
+	earlier, err := secondStore.TryAcquireUserLease(t.Context(), earlierRequest)
+	require.NoError(t, err)
+	require.False(t, earlier.Acquired)
+	require.False(t, earlier.QueueFull)
+
+	require.True(t, harness.settingService.GetExtraConcurrencyRuntimeSettings(t.Context()).Enabled)
+	disabled.Store(true)
+	harness.settingService.InvalidateExtraConcurrencyRuntimeSettings()
+	require.False(t, harness.settingService.GetExtraConcurrencyRuntimeSettings(t.Context()).Enabled)
+
+	responses := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		responses <- harness.responsesRequestForUser("request-drain-legacy", harness.userID, 1, 5)
+	}()
+	select {
+	case accountID := <-upstream.arrivals:
+		t.Fatalf("feature-off legacy request exceeded the shared user limit on account %d", accountID)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	require.NoError(t, secondStore.ReleaseUserLease(t.Context(), harness.userID, standardRequest.RequestID))
+	require.NoError(t, secondStore.ReleaseUserLease(t.Context(), harness.userID, extraRequest.RequestID))
+	earlier, err = secondStore.TryAcquireUserLease(t.Context(), earlierRequest)
+	require.NoError(t, err)
+	require.True(t, earlier.Acquired)
+	require.Equal(t, service.AdmissionClassStandard, earlier.Class)
+	select {
+	case accountID := <-upstream.arrivals:
+		t.Fatalf("feature-off legacy request bypassed the earlier gateway waiter on account %d", accountID)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	require.NoError(t, secondStore.ReleaseUserLease(t.Context(), harness.userID, earlierRequest.RequestID))
+	select {
+	case <-upstream.arrivals:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the legacy request after gateway user state drained")
+	}
+	releaseUpstreamNow()
+	response := requireOpenAIExtraConcurrencyHTTPResponse(t, responses, "drained legacy request")
+	require.Equal(t, http.StatusOK, response.Code)
+}
+
+func TestOpenAIResponsesEmergencyDisableUsesLegacyConcurrencyPlusTwentyForNewRequests(t *testing.T) {
+	disabled := &atomic.Bool{}
+	releaseUpstream := make(chan struct{})
+	upstream := &blockingOpenAIExtraConcurrencyUpstream{
+		arrivals: make(chan int64, 32),
+		release:  releaseUpstream,
+	}
+	harness := newOpenAIExtraConcurrencyRoutesHarness(
+		t,
+		extraConcurrencySettingRepository{waitTimeoutSeconds: 3, disabledFlag: disabled},
+		upstream,
+		nil,
+		openAIEmergencyExtraConcurrencyAccount("openai-legacy-emergency"),
+	)
+	releaseUpstreamNow := closeChannelOnCleanup(t, releaseUpstream)
+	require.True(t, harness.settingService.GetExtraConcurrencyRuntimeSettings(t.Context()).Enabled)
+	disabled.Store(true)
+	harness.settingService.InvalidateExtraConcurrencyRuntimeSettings()
+	require.False(t, harness.settingService.GetExtraConcurrencyRuntimeSettings(t.Context()).Enabled)
+
+	responses := make(chan *httptest.ResponseRecorder, 21)
+	go func() {
+		responses <- harness.responsesRequestForUser("request-legacy-active", harness.userID, 1, 5)
+	}()
+	select {
+	case <-upstream.arrivals:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the legacy active request to reach upstream")
+	}
+	for index := range 20 {
+		go func() {
+			responses <- harness.responsesRequestForUser(
+				fmt.Sprintf("request-legacy-wait-%02d", index),
+				harness.userID,
+				1,
+				5,
+			)
+		}()
+	}
+	require.Eventually(t, func() bool {
+		loads, err := harness.legacyConcurrency.GetUsersLoadBatch(t.Context(), []service.UserWithConcurrency{{
+			ID:               harness.userID,
+			MaxConcurrency:   1,
+			ExtraConcurrency: 5,
+		}})
+		if err != nil || loads[harness.userID] == nil {
+			return false
+		}
+		load := loads[harness.userID]
+		return load.StandardConcurrency == 1 && load.ExtraConcurrency == 0 && load.WaitingCount == 20
+	}, 3*time.Second, 20*time.Millisecond)
+
+	overflow := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		overflow <- harness.responsesRequestForUser("request-legacy-overflow", harness.userID, 1, 5)
+	}()
+	select {
+	case response := <-overflow:
+		require.Equal(t, http.StatusTooManyRequests, response.Code)
+		require.Contains(t, response.Body.String(), "Too many pending requests")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the 21st legacy waiter did not fail before upstream release")
+	}
+	select {
+	case accountID := <-upstream.arrivals:
+		t.Fatalf("legacy waiter reached upstream before the standard slot was released: account=%d", accountID)
+	case <-time.After(200 * time.Millisecond):
+	}
+	select {
+	case attempt := <-harness.observer.userAttempts:
+		t.Fatalf("feature-off request unexpectedly used GatewayAdmission: %+v", attempt)
+	default:
+	}
+
+	releaseUpstreamNow()
+	for range 21 {
+		response := requireOpenAIExtraConcurrencyHTTPResponse(t, responses, "legacy request")
+		require.Equal(t, http.StatusOK, response.Code)
+	}
+	require.Equal(t, int32(21), upstream.calls.Load())
+	require.Eventually(t, func() bool {
+		loads, err := harness.legacyConcurrency.GetUsersLoadBatch(t.Context(), []service.UserWithConcurrency{{
+			ID:               harness.userID,
+			MaxConcurrency:   1,
+			ExtraConcurrency: 5,
+		}})
+		if err != nil || loads[harness.userID] == nil {
+			return false
+		}
+		load := loads[harness.userID]
+		return load.StandardConcurrency == 0 && load.ExtraConcurrency == 0 && load.WaitingCount == 0
+	}, 3*time.Second, 20*time.Millisecond)
 }
 
 func TestOpenAIResponsesFeatureDisabledKeepsLegacyStandardLimit(t *testing.T) {

@@ -187,6 +187,53 @@ func TestGatewayAdmissionStoreAllocatesStandardBeforeExtraAcrossInstances(t *tes
 	require.Equal(t, service.AdmissionClassStandard, promoted.Class)
 }
 
+func TestGatewayAdmissionStoreDisablingExtraRequeuesWithOriginalOrder(t *testing.T) {
+	store := NewGatewayAdmissionStore(testRedis(t), time.Minute)
+	request := service.UserLeaseRequest{
+		UserID:        43,
+		StandardLimit: 1,
+		ExtraLimit:    1,
+		MaxWaiting:    2,
+		WaitTimeout:   time.Second,
+	}
+
+	request.RequestID = "active-standard"
+	active, err := store.TryAcquireUserLease(t.Context(), request)
+	require.NoError(t, err)
+	require.True(t, active.Acquired)
+	require.Equal(t, service.AdmissionClassStandard, active.Class)
+
+	request.RequestID = "earlier-extra"
+	earlier, err := store.TryAcquireUserLease(t.Context(), request)
+	require.NoError(t, err)
+	require.True(t, earlier.Acquired)
+	require.Equal(t, service.AdmissionClassExtra, earlier.Class)
+
+	request.RequestID = "later-standard"
+	request.ExtraLimit = 0
+	later, err := store.TryAcquireUserLease(t.Context(), request)
+	require.NoError(t, err)
+	require.False(t, later.Acquired)
+
+	request.RequestID = "earlier-extra"
+	converted, err := store.TryAcquireUserLease(t.Context(), request)
+	require.NoError(t, err)
+	require.False(t, converted.Acquired)
+
+	require.NoError(t, store.ReleaseUserLease(t.Context(), request.UserID, "active-standard"))
+
+	request.RequestID = "later-standard"
+	later, err = store.TryAcquireUserLease(t.Context(), request)
+	require.NoError(t, err)
+	require.False(t, later.Acquired)
+
+	request.RequestID = "earlier-extra"
+	earlier, err = store.TryAcquireUserLease(t.Context(), request)
+	require.NoError(t, err)
+	require.True(t, earlier.Acquired)
+	require.Equal(t, service.AdmissionClassStandard, earlier.Class)
+}
+
 func TestGatewayAdmissionStoreExtraTargetPreservesPlatformReserve(t *testing.T) {
 	rdb := testRedis(t)
 	firstStore := NewGatewayAdmissionStore(rdb, time.Minute)
@@ -284,6 +331,41 @@ func TestGatewayAdmissionStoreSharesAccountCapacityWithLegacyConcurrency(t *test
 	require.NoError(t, err)
 	require.False(t, competing)
 	require.NoError(t, store.ReleaseTargetLease(t.Context(), request.Platform, accountID, request.RequestID))
+}
+
+func TestGatewayAdmissionStoreSharesUserCapacityWithLegacyConcurrencyAcrossClients(t *testing.T) {
+	clients := testRedisClients(t, 2)
+	legacy := NewConcurrencyCache(clients[0], 1, 60)
+	gateway := NewGatewayAdmissionStore(clients[1], time.Minute)
+	const userID int64 = 110
+
+	legacyAcquired, err := legacy.AcquireUserSlot(t.Context(), userID, 1, "legacy-standard")
+	require.NoError(t, err)
+	require.True(t, legacyAcquired)
+
+	first, err := gateway.TryAcquireUserLease(t.Context(), service.UserLeaseRequest{
+		RequestID:     "stale-enabled-first",
+		UserID:        userID,
+		StandardLimit: 1,
+		ExtraLimit:    1,
+		MaxWaiting:    20,
+		WaitTimeout:   time.Minute,
+	})
+	require.NoError(t, err)
+	require.True(t, first.Acquired)
+	require.Equal(t, service.AdmissionClassExtra, first.Class)
+
+	second, err := gateway.TryAcquireUserLease(t.Context(), service.UserLeaseRequest{
+		RequestID:     "stale-enabled-second",
+		UserID:        userID,
+		StandardLimit: 1,
+		ExtraLimit:    1,
+		MaxWaiting:    20,
+		WaitTimeout:   time.Minute,
+	})
+	require.NoError(t, err)
+	require.False(t, second.Acquired)
+	require.False(t, second.QueueFull)
 }
 
 func TestGatewayAdmissionStoreStandardWaiterBlocksEarlierExtraWaiter(t *testing.T) {
@@ -436,6 +518,64 @@ func TestGatewayAdmissionStoreRenewKeepsUserAndTargetLeasesAlive(t *testing.T) {
 	competingLease, err := store.TryAcquireTargetLease(t.Context(), competingTarget)
 	require.NoError(t, err)
 	require.False(t, competingLease.Acquired)
+}
+
+func TestGatewayAdmissionStoreBeginDispatchRejectsExpiredMemberKeptAliveByPeer(t *testing.T) {
+	const leaseTTL = 500 * time.Millisecond
+	store := NewGatewayAdmissionStore(testRedis(t), leaseTTL)
+	request := service.TargetLeaseRequest{
+		Platform:         service.PlatformAnthropic,
+		AccountID:        405,
+		AccountLimit:     2,
+		PlatformCapacity: 2,
+		Class:            service.AdmissionClassStandard,
+	}
+
+	request.RequestID = "expired-before-dispatch"
+	first, err := store.TryAcquireTargetLease(t.Context(), request)
+	require.NoError(t, err)
+	require.True(t, first.Acquired)
+	request.RequestID = "live-peer"
+	second, err := store.TryAcquireTargetLease(t.Context(), request)
+	require.NoError(t, err)
+	require.True(t, second.Acquired)
+
+	time.Sleep(300 * time.Millisecond)
+	renewed, err := store.RenewTargetLease(
+		t.Context(),
+		request.Platform,
+		request.AccountID,
+		"live-peer",
+	)
+	require.NoError(t, err)
+	require.True(t, renewed)
+	time.Sleep(300 * time.Millisecond)
+	renewed, err = store.RenewTargetLease(
+		t.Context(),
+		request.Platform,
+		request.AccountID,
+		"expired-before-dispatch",
+	)
+	require.NoError(t, err)
+	require.False(t, renewed, "renewal must not resurrect an already expired target member")
+
+	expired, err := store.BeginTargetDispatch(t.Context(), service.TargetDispatchRequest{
+		RequestID: "expired-before-dispatch",
+		Platform:  request.Platform,
+		AccountID: request.AccountID,
+		Class:     request.Class,
+	})
+	require.NoError(t, err)
+	require.False(t, expired.Started, "an expired sorted-set member must not be resurrected at dispatch")
+
+	live, err := store.BeginTargetDispatch(t.Context(), service.TargetDispatchRequest{
+		RequestID: "live-peer",
+		Platform:  request.Platform,
+		AccountID: request.AccountID,
+		Class:     request.Class,
+	})
+	require.NoError(t, err)
+	require.True(t, live.Started, "the peer renewal must keep the shared keys alive for this assertion")
 }
 
 func TestGatewayAdmissionDispatchAutomaticallyRenewsRedisLeasesUntilCompletion(t *testing.T) {
@@ -608,6 +748,74 @@ func TestGatewayAdmissionStoreUserLeaseContentionAcrossRedisClients(t *testing.T
 
 	require.Equal(t, 1, standardCount)
 	require.Equal(t, 1, extraCount)
+}
+
+func TestUserLoadBatchSplitsGatewayStandardAndExtraWithCombinedWaiting(t *testing.T) {
+	ctx := t.Context()
+	clients := testRedisClients(t, 2)
+	legacy := NewConcurrencyCache(clients[0], 1, 60)
+	gateway := NewGatewayAdmissionStore(clients[1], time.Minute)
+	const userID int64 = 506
+
+	legacyAcquired, err := legacy.AcquireUserSlot(ctx, userID, 2, "legacy-standard")
+	require.NoError(t, err)
+	require.True(t, legacyAcquired)
+	require.True(t, mustIncrementWaitCount(t, legacy, ctx, userID, 20))
+
+	standard, err := gateway.TryAcquireUserLease(ctx, service.UserLeaseRequest{
+		RequestID:     "gateway-standard",
+		UserID:        userID,
+		StandardLimit: 2,
+		ExtraLimit:    1,
+		MaxWaiting:    20,
+		WaitTimeout:   time.Minute,
+	})
+	require.NoError(t, err)
+	require.True(t, standard.Acquired)
+	require.Equal(t, service.AdmissionClassStandard, standard.Class)
+
+	extra, err := gateway.TryAcquireUserLease(ctx, service.UserLeaseRequest{
+		RequestID:     "gateway-extra",
+		UserID:        userID,
+		StandardLimit: 2,
+		ExtraLimit:    1,
+		MaxWaiting:    20,
+		WaitTimeout:   time.Minute,
+	})
+	require.NoError(t, err)
+	require.True(t, extra.Acquired)
+	require.Equal(t, service.AdmissionClassExtra, extra.Class)
+
+	waiting, err := gateway.TryAcquireUserLease(ctx, service.UserLeaseRequest{
+		RequestID:     "gateway-waiting",
+		UserID:        userID,
+		StandardLimit: 2,
+		ExtraLimit:    1,
+		MaxWaiting:    20,
+		WaitTimeout:   time.Minute,
+	})
+	require.NoError(t, err)
+	require.False(t, waiting.Acquired)
+
+	loads, err := legacy.GetUsersLoadBatch(ctx, []service.UserWithConcurrency{{
+		ID:               userID,
+		MaxConcurrency:   2,
+		ExtraConcurrency: 1,
+	}})
+	require.NoError(t, err)
+	load := loads[userID]
+	require.NotNil(t, load)
+	require.Equal(t, 2, load.StandardConcurrency)
+	require.Equal(t, 1, load.ExtraConcurrency)
+	require.Equal(t, 3, load.CurrentConcurrency)
+	require.Equal(t, 2, load.WaitingCount)
+}
+
+func mustIncrementWaitCount(t *testing.T, cache service.ConcurrencyCache, ctx context.Context, userID int64, maxWait int) bool {
+	t.Helper()
+	ok, err := cache.IncrementWaitCount(ctx, userID, maxWait)
+	require.NoError(t, err)
+	return ok
 }
 
 func TestGatewayAdmissionStoreUnlimitedStandardNeverConsumesExtra(t *testing.T) {

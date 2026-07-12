@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -31,4 +32,33 @@ func TestGatewayAdmissionCapacityDeduplicatesSchedulablePlatformAccounts(t *test
 	require.NoError(t, err)
 	require.Equal(t, 5, snapshot.TotalConcurrency)
 	require.Equal(t, map[int64]int{1: 2, 4: 3}, snapshot.AccountConcurrency)
+}
+
+func TestGatewayAdmissionCapacityUsesSchedulerProjectionWithoutDatabaseQuery(t *testing.T) {
+	databaseCalls := 0
+	repo := &mockAccountRepoForPlatform{
+		listPlatformFunc: func(context.Context, string) ([]Account, error) {
+			databaseCalls++
+			return nil, nil
+		},
+	}
+	cache := &admissionCapacityTTLCache{
+		snapshotHydrationCache: &snapshotHydrationCache{},
+		snapshot: AdmissionCapacitySnapshot{
+			TotalConcurrency:   7,
+			AccountConcurrency: map[int64]int{11: 3, 12: 4},
+			BuiltAt:            time.Now().UTC(),
+		},
+	}
+	svc := &GatewayService{
+		accountRepo:       repo,
+		schedulerSnapshot: NewSchedulerSnapshotService(cache, nil, repo, nil, nil),
+	}
+
+	snapshot, err := svc.AdmissionCapacity(context.Background(), PlatformAnthropic)
+
+	require.NoError(t, err)
+	require.Equal(t, 7, snapshot.TotalConcurrency)
+	require.Equal(t, map[int64]int{11: 3, 12: 4}, snapshot.AccountConcurrency)
+	require.Zero(t, databaseCalls)
 }

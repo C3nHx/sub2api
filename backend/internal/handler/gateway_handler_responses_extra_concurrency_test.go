@@ -47,6 +47,10 @@ func (s *responsesRetryAdmissionStore) TryAcquireTargetLease(context.Context, se
 	return service.TargetLeaseResult{Acquired: true}, nil
 }
 
+func (s *responsesRetryAdmissionStore) BeginTargetDispatch(context.Context, service.TargetDispatchRequest) (service.TargetDispatchResult, error) {
+	return service.TargetDispatchResult{Started: true}, nil
+}
+
 func (s *responsesRetryAdmissionStore) RenewTargetLease(context.Context, string, int64, string) (bool, error) {
 	return true, nil
 }

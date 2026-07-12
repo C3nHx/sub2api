@@ -123,12 +123,17 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			ExtraLimit:    subject.ExtraConcurrency,
 			Settings:      extraSettings,
 		})
-		if err == nil {
+		if errors.Is(err, service.ErrGatewayAdmissionDraining) {
+			useExtraAdmission = false
+			err = nil
+		}
+		if useExtraAdmission && err == nil {
 			release := h.concurrencyHelper.withAPIKeySlotFromGin(c, extraAdmission.Close)
 			release = wrapReleaseOnDone(c.Request.Context(), release)
 			defer release()
 		}
-	} else {
+	}
+	if !useExtraAdmission {
 		var acquired bool
 		admission, acquired = h.beginResponsesAdmission(c, subject.UserID, subject.Concurrency, reqStream, &streamStarted, reqLog)
 		if !acquired {
@@ -244,10 +249,12 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			return
 		}
 		account := selection.Account
-		sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
-		reqLog.Debug("openai_chat_completions.account_selected", zap.Int64("account_id", account.ID), zap.String("account_name", account.Name))
 		_ = scheduleDecision
-		setOpsSelectedAccount(c, account.ID, account.Platform)
+		if !useExtraAdmission {
+			sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
+			reqLog.Debug("openai_chat_completions.account_selected", zap.Int64("account_id", account.ID), zap.String("account_name", account.Name))
+			setOpsSelectedAccount(c, account.ID, account.Platform)
+		}
 
 		if !useExtraAdmission && !h.admitResponsesAccount(c, admission, apiKey.GroupID, sessionHash, selection, &streamStarted, reqLog) {
 			return
@@ -294,8 +301,9 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			}
 		}
 		if useExtraAdmission {
-			err = admittedTarget.Dispatch(
+			_, err = admittedTarget.DispatchPrepared(
 				c.Request.Context(),
+				nil,
 				func(ctx context.Context) error {
 					billingRecheckErr = h.billingCacheService.RecheckBillingEligibility(
 						ctx,
@@ -307,8 +315,17 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 					)
 					return billingRecheckErr
 				},
-				forwardSameAccount,
+				func(ctx context.Context, targetAccount *service.Account) error {
+					account = targetAccount
+					sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, targetAccount)
+					reqLog.Debug("openai_chat_completions.account_selected", zap.Int64("account_id", targetAccount.ID), zap.String("account_name", targetAccount.Name))
+					ctx = setOpsSelectedAccountContext(c, ctx, targetAccount.ID, targetAccount.Platform)
+					return forwardSameAccount(ctx, targetAccount)
+				},
 			)
+			if admittedTarget.Account != nil {
+				account = admittedTarget.Account
+			}
 		} else {
 			err = func() error {
 				defer admission.ReleaseAccount()
@@ -322,6 +339,11 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 				c.Header("Retry-After", strconv.Itoa(retryAfter))
 			}
 			h.handleStreamingAwareError(c, status, code, message, streamStarted)
+			return
+		}
+		if useExtraAdmission && isGatewayAdmissionConcurrencyError(err) {
+			reqLog.Warn("openai_chat_completions.extra_admission_dispatch_failed", zap.Error(err))
+			h.handleConcurrencyError(c, err, "account", streamStarted)
 			return
 		}
 		if c.Request.Context().Err() != nil {

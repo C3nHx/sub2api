@@ -228,12 +228,17 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 			ExtraLimit:    authSubject.ExtraConcurrency,
 			Settings:      extraSettings,
 		})
-		if err == nil {
+		if errors.Is(err, service.ErrGatewayAdmissionDraining) {
+			useExtraAdmission = false
+			err = nil
+		}
+		if useExtraAdmission && err == nil {
 			release := h.concurrencyHelper.withAPIKeySlotFromGin(c, extraAdmission.Close)
 			release = wrapReleaseOnDone(c.Request.Context(), release)
 			defer release()
 		}
-	} else {
+	}
+	if !useExtraAdmission {
 		// Feature-off compatibility is structural: retain the legacy helper path.
 		geminiConcurrency := NewConcurrencyHelper(h.concurrencyHelper.concurrencyService, SSEPingFormatNone, 0)
 		admission, err = geminiConcurrency.Begin(c, UserAdmissionRequest{
@@ -433,30 +438,55 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 		} else {
 			account = selection.Account
 		}
-		setOpsSelectedAccount(c, account.ID, account.Platform)
+		candidateBody := append([]byte(nil), body...)
+		candidateBoundAccountID := sessionBoundAccountID
+		candidateCleanedForUnknown := cleanedForUnknownBinding
+		var (
+			preparedBody              []byte
+			preparedBoundAccountID    int64
+			preparedCleanedForUnknown bool
+			preparedBindingLog        string
+		)
+		prepareTarget := func(_ context.Context, targetAccount *service.Account) (service.GatewayTargetPreparation, error) {
+			preparedBody = append([]byte(nil), candidateBody...)
+			preparedBoundAccountID = candidateBoundAccountID
+			preparedCleanedForUnknown = candidateCleanedForUnknown
+			preparedBindingLog = ""
+			if candidateBoundAccountID > 0 && candidateBoundAccountID != targetAccount.ID {
+				preparedBody = service.CleanGeminiNativeThoughtSignatures(preparedBody)
+				preparedBoundAccountID = targetAccount.ID
+				preparedBindingLog = "switched"
+			} else if sessionKey != "" && candidateBoundAccountID == 0 && !candidateCleanedForUnknown && bytes.Contains(preparedBody, []byte(`"thoughtSignature"`)) {
+				preparedBody = service.CleanGeminiNativeThoughtSignatures(preparedBody)
+				preparedCleanedForUnknown = true
+				preparedBoundAccountID = targetAccount.ID
+				preparedBindingLog = "missing"
+			} else if candidateBoundAccountID == 0 {
+				preparedBoundAccountID = targetAccount.ID
+			}
+			return service.GatewayTargetPreparation{}, nil
+		}
+		commitPreparedTarget := func(targetAccount *service.Account) {
+			account = targetAccount
+			body = preparedBody
+			sessionBoundAccountID = preparedBoundAccountID
+			cleanedForUnknownBinding = preparedCleanedForUnknown
+			switch preparedBindingLog {
+			case "switched":
+				reqLog.Info("gemini.sticky_session_account_switched",
+					zap.Int64("from_account_id", candidateBoundAccountID),
+					zap.Int64("to_account_id", targetAccount.ID),
+					zap.Bool("clean_thought_signature", true),
+				)
+			case "missing":
+				reqLog.Info("gemini.sticky_session_binding_missing", zap.Bool("clean_thought_signature", true))
+			}
+		}
 
-		// 检测账号切换：如果粘性会话绑定的账号与当前选择的账号不同，清除 thoughtSignature
-		// 注意：Gemini 原生 API 的 thoughtSignature 与具体上游账号强相关；跨账号透传会导致 400。
-		if sessionBoundAccountID > 0 && sessionBoundAccountID != account.ID {
-			reqLog.Info("gemini.sticky_session_account_switched",
-				zap.Int64("from_account_id", sessionBoundAccountID),
-				zap.Int64("to_account_id", account.ID),
-				zap.Bool("clean_thought_signature", true),
-			)
-			body = service.CleanGeminiNativeThoughtSignatures(body)
-			sessionBoundAccountID = account.ID
-		} else if sessionKey != "" && sessionBoundAccountID == 0 && !cleanedForUnknownBinding && bytes.Contains(body, []byte(`"thoughtSignature"`)) {
-			// 无缓存绑定但请求里已有 thoughtSignature：常见于缓存丢失/TTL 过期后，客户端继续携带旧签名。
-			// 为避免第一次转发就 400，这里做一次确定性清理，让新账号重新生成签名链路。
-			reqLog.Info("gemini.sticky_session_binding_missing",
-				zap.Bool("clean_thought_signature", true),
-			)
-			body = service.CleanGeminiNativeThoughtSignatures(body)
-			cleanedForUnknownBinding = true
-			sessionBoundAccountID = account.ID
-		} else if sessionBoundAccountID == 0 {
-			// 记录本次请求中首次选择到的账号，便于同一请求内 failover 时检测切换。
-			sessionBoundAccountID = account.ID
+		if !useExtraAdmission {
+			_, _ = prepareTarget(c.Request.Context(), account)
+			commitPreparedTarget(account)
+			setOpsSelectedAccount(c, account.ID, account.Platform)
 		}
 
 		// 4) account concurrency slot. The shared path already holds the target lease atomically.
@@ -531,8 +561,9 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 		}
 		var billingRecheckErr error
 		if useExtraAdmission {
-			err = admittedTarget.Dispatch(
+			_, err = admittedTarget.DispatchPrepared(
 				requestCtx,
+				prepareTarget,
 				func(ctx context.Context) error {
 					billingRecheckErr = h.billingCacheService.RecheckBillingEligibility(
 						ctx,
@@ -544,8 +575,15 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 					)
 					return billingRecheckErr
 				},
-				forwardSameAccount,
+				func(ctx context.Context, targetAccount *service.Account) error {
+					commitPreparedTarget(targetAccount)
+					ctx = setOpsSelectedAccountContext(c, ctx, targetAccount.ID, targetAccount.Platform)
+					return forwardSameAccount(ctx, targetAccount)
+				},
 			)
+			if admittedTarget.Account != nil {
+				account = admittedTarget.Account
+			}
 		} else {
 			err = forwardSameAccount(requestCtx, account)
 			admission.ReleaseAccount()
@@ -557,6 +595,11 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 				c.Header("Retry-After", strconv.Itoa(retryAfter))
 			}
 			googleError(c, status, message)
+			return
+		}
+		if useExtraAdmission && isGatewayAdmissionConcurrencyError(err) {
+			reqLog.Warn("gemini.extra_admission_dispatch_failed", zap.Error(err))
+			googleConcurrencyError(c, err, "account")
 			return
 		}
 		if err != nil {

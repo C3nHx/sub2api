@@ -6,8 +6,28 @@ import (
 	"context"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
 	"github.com/stretchr/testify/require"
 )
+
+type extraConcurrencyHistoryRepoStub struct {
+	*balanceRedeemRepoStub
+}
+
+func (s *extraConcurrencyHistoryRepoStub) ListByUserPaginated(_ context.Context, userID int64, _ pagination.PaginationParams, codeType string) ([]RedeemCode, *pagination.PaginationResult, error) {
+	codes := make([]RedeemCode, 0, len(s.created))
+	for _, code := range s.created {
+		if code == nil || code.UsedBy == nil || *code.UsedBy != userID || (codeType != "" && code.Type != codeType) {
+			continue
+		}
+		codes = append(codes, *code)
+	}
+	return codes, &pagination.PaginationResult{Total: int64(len(codes))}, nil
+}
+
+func (s *extraConcurrencyHistoryRepoStub) SumPositiveBalanceByUser(context.Context, int64) (float64, error) {
+	return 0, nil
+}
 
 func TestAdminService_UpdateUserExtraConcurrencyRecordsAdjustment(t *testing.T) {
 	baseRepo := &userRepoStub{user: &User{
@@ -20,7 +40,9 @@ func TestAdminService_UpdateUserExtraConcurrencyRecordsAdjustment(t *testing.T) 
 		ExtraConcurrency: 1,
 	}}
 	repo := &balanceUserRepoStub{userRepoStub: baseRepo}
-	redeemRepo := &balanceRedeemRepoStub{redeemRepoStub: &redeemRepoStub{}}
+	redeemRepo := &extraConcurrencyHistoryRepoStub{
+		balanceRedeemRepoStub: &balanceRedeemRepoStub{redeemRepoStub: &redeemRepoStub{}},
+	}
 	invalidator := &authCacheInvalidatorStub{}
 	svc := &adminServiceImpl{
 		userRepo:             repo,
@@ -40,6 +62,13 @@ func TestAdminService_UpdateUserExtraConcurrencyRecordsAdjustment(t *testing.T) 
 	require.Len(t, redeemRepo.created, 1)
 	require.Equal(t, AdjustmentTypeAdminExtraConcurrency, redeemRepo.created[0].Type)
 	require.Equal(t, float64(2), redeemRepo.created[0].Value)
+
+	history, total, _, err := svc.GetUserBalanceHistory(context.Background(), 7, 1, 10, AdjustmentTypeAdminExtraConcurrency)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), total)
+	require.Len(t, history, 1)
+	require.Equal(t, AdjustmentTypeAdminExtraConcurrency, history[0].Type)
+	require.Equal(t, float64(2), history[0].Value)
 }
 
 func TestAdminService_UpdateUserRejectsNegativeExtraConcurrency(t *testing.T) {

@@ -143,12 +143,17 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 			ExtraLimit:    subject.ExtraConcurrency,
 			Settings:      extraSettings,
 		})
-		if err == nil {
+		if errors.Is(err, service.ErrGatewayAdmissionDraining) {
+			useExtraAdmission = false
+			err = nil
+		}
+		if useExtraAdmission && err == nil {
 			release := h.concurrencyHelper.withAPIKeySlotFromGin(c, extraAdmission.Close)
 			release = wrapReleaseOnDone(c.Request.Context(), release)
 			defer release()
 		}
-	} else {
+	}
+	if !useExtraAdmission {
 		// Feature-off compatibility is structural: retain the legacy helper path.
 		admission, err = h.concurrencyHelper.Begin(c, UserAdmissionRequest{
 			UserID:         subject.UserID,
@@ -252,7 +257,9 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		} else {
 			account = selection.Account
 		}
-		setOpsSelectedAccount(c, account.ID, account.Platform)
+		if !useExtraAdmission {
+			setOpsSelectedAccount(c, account.ID, account.Platform)
+		}
 
 		// 4. Acquire account concurrency slot. NextTarget owns it on the new path.
 		if !useExtraAdmission {
@@ -303,8 +310,9 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		}
 		var billingRecheckErr error
 		if useExtraAdmission {
-			err = admittedTarget.Dispatch(
+			_, err = admittedTarget.DispatchPrepared(
 				requestCtx,
+				nil,
 				func(ctx context.Context) error {
 					billingRecheckErr = h.billingCacheService.RecheckBillingEligibility(
 						ctx,
@@ -316,8 +324,15 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 					)
 					return billingRecheckErr
 				},
-				forwardSameAccount,
+				func(ctx context.Context, targetAccount *service.Account) error {
+					account = targetAccount
+					ctx = setOpsSelectedAccountContext(c, ctx, targetAccount.ID, targetAccount.Platform)
+					return forwardSameAccount(ctx, targetAccount)
+				},
 			)
+			if admittedTarget.Account != nil {
+				account = admittedTarget.Account
+			}
 		} else {
 			err = func() error {
 				defer admission.ReleaseAccount()
@@ -334,6 +349,11 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 				c.Header("Retry-After", strconv.Itoa(retryAfter))
 			}
 			h.responsesErrorResponse(c, status, code, message)
+			return
+		}
+		if useExtraAdmission && isGatewayAdmissionConcurrencyError(err) {
+			reqLog.Warn("gateway.responses.extra_admission_dispatch_failed", zap.Error(err))
+			h.handleResponsesConcurrencyError(c, err, "account", streamStarted)
 			return
 		}
 

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -26,6 +27,8 @@ type UserLeaseResult struct {
 	Class     AdmissionClass
 	Unlimited bool
 	QueueFull bool
+	Draining  bool
+	Expired   bool
 }
 
 type TargetLeaseRequest struct {
@@ -43,6 +46,20 @@ type TargetLeaseRequest struct {
 type TargetLeaseResult struct {
 	Acquired bool
 	Expired  bool
+	Draining bool
+}
+
+type TargetDispatchRequest struct {
+	RequestID string
+	Platform  string
+	AccountID int64
+	Class     AdmissionClass
+	Unlimited bool
+}
+
+type TargetDispatchResult struct {
+	Started  bool
+	Draining bool
 }
 
 type ExtraConcurrencyUnavailableError struct {
@@ -54,6 +71,8 @@ func (e *ExtraConcurrencyUnavailableError) Error() string {
 }
 
 type GatewayAdmissionQueueFullError struct{}
+
+var ErrGatewayAdmissionDraining = errors.New("gateway admission is draining")
 
 func (e *GatewayAdmissionQueueFullError) Error() string {
 	return "gateway admission wait queue is full"
@@ -80,6 +99,7 @@ type GatewayAdmissionStore interface {
 	RenewUserLease(ctx context.Context, userID int64, requestID string, class AdmissionClass) (bool, error)
 	ReleaseUserLease(ctx context.Context, userID int64, requestID string) error
 	TryAcquireTargetLease(ctx context.Context, request TargetLeaseRequest) (TargetLeaseResult, error)
+	BeginTargetDispatch(ctx context.Context, request TargetDispatchRequest) (TargetDispatchResult, error)
 	RenewTargetLease(ctx context.Context, platform string, accountID int64, requestID string) (bool, error)
 	ReleaseTargetLease(ctx context.Context, platform string, accountID int64, requestID string) error
 }

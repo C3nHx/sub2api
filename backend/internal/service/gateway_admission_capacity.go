@@ -3,11 +3,14 @@ package service
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 type AdmissionCapacitySnapshot struct {
 	TotalConcurrency   int
 	AccountConcurrency map[int64]int
+	BuiltAt            time.Time
+	ValidUntil         *time.Time
 }
 
 type AdmissionCapacitySource interface {
@@ -15,6 +18,9 @@ type AdmissionCapacitySource interface {
 }
 
 func (s *GatewayService) AdmissionCapacity(ctx context.Context, platform string) (AdmissionCapacitySnapshot, error) {
+	if s != nil && s.schedulerSnapshot != nil {
+		return s.schedulerSnapshot.AdmissionCapacity(ctx, platform)
+	}
 	if s == nil || s.accountRepo == nil {
 		return AdmissionCapacitySnapshot{}, fmt.Errorf("gateway admission capacity source is unavailable")
 	}
@@ -24,8 +30,13 @@ func (s *GatewayService) AdmissionCapacity(ctx context.Context, platform string)
 		return AdmissionCapacitySnapshot{}, fmt.Errorf("list gateway admission capacity for %s: %w", platform, err)
 	}
 
+	return buildAdmissionCapacitySnapshot(platform, accounts), nil
+}
+
+func buildAdmissionCapacitySnapshot(platform string, accounts []Account) AdmissionCapacitySnapshot {
 	snapshot := AdmissionCapacitySnapshot{
 		AccountConcurrency: make(map[int64]int, len(accounts)),
+		BuiltAt:            time.Now().UTC(),
 	}
 	for i := range accounts {
 		account := &accounts[i]
@@ -37,6 +48,11 @@ func (s *GatewayService) AdmissionCapacity(ctx context.Context, platform string)
 		}
 		snapshot.AccountConcurrency[account.ID] = account.Concurrency
 		snapshot.TotalConcurrency += account.Concurrency
+		if account.AutoPauseOnExpired && account.ExpiresAt != nil &&
+			(snapshot.ValidUntil == nil || account.ExpiresAt.Before(*snapshot.ValidUntil)) {
+			validUntil := account.ExpiresAt.UTC()
+			snapshot.ValidUntil = &validUntil
+		}
 	}
-	return snapshot, nil
+	return snapshot
 }

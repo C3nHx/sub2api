@@ -20,23 +20,47 @@ var (
 		local queueKey = KEYS[3]
 		local sequenceKey = KEYS[4]
 		local deadlineKey = KEYS[5]
+		local arrivalKey = KEYS[6]
+		local originalDeadlineKey = KEYS[7]
+		local legacyStandardKey = KEYS[8]
+		local drainKey = KEYS[9]
 		local requestID = ARGV[1]
 		local standardLimit = tonumber(ARGV[2])
 		local extraLimit = tonumber(ARGV[3])
 		local ttlMs = tonumber(ARGV[4])
 		local maxWaiting = tonumber(ARGV[5])
 		local waitTimeoutMs = tonumber(ARGV[6])
+		local legacyTTLSeconds = tonumber(ARGV[7])
 
 		local nowParts = redis.call('TIME')
 		local nowMs = tonumber(nowParts[1]) * 1000 + math.floor(tonumber(nowParts[2]) / 1000)
 		local expiresAt = nowMs + ttlMs
+		local draining = redis.call('EXISTS', drainKey) > 0
 
 		redis.call('ZREMRANGEBYSCORE', standardKey, '-inf', nowMs)
 		redis.call('ZREMRANGEBYSCORE', extraKey, '-inf', nowMs)
+		redis.call('ZREMRANGEBYSCORE', legacyStandardKey, '-inf', math.floor(nowMs / 1000) - legacyTTLSeconds)
+		local legacyStandardCount = redis.call('ZCARD', legacyStandardKey)
 		local expiredRequests = redis.call('ZRANGEBYSCORE', deadlineKey, '-inf', nowMs)
 		for _, expiredRequestID in ipairs(expiredRequests) do
 			redis.call('ZREM', queueKey, expiredRequestID)
 			redis.call('ZREM', deadlineKey, expiredRequestID)
+			redis.call('ZREM', arrivalKey, expiredRequestID)
+		end
+		-- Keep an expired request tombstone for one lease TTL so immediate retries
+		-- cannot renew their absolute deadline. After that grace period, reclaim
+		-- metadata left by a crashed owner once no live lease or queue entry exists.
+		local staleOriginalRequests = redis.call(
+			'ZRANGEBYSCORE', originalDeadlineKey, '-inf', nowMs - ttlMs, 'LIMIT', 0, 1000
+		)
+		for _, staleRequestID in ipairs(staleOriginalRequests) do
+			if redis.call('ZSCORE', standardKey, staleRequestID) == false and
+				redis.call('ZSCORE', extraKey, staleRequestID) == false and
+				redis.call('ZSCORE', queueKey, staleRequestID) == false then
+				redis.call('ZREM', deadlineKey, staleRequestID)
+				redis.call('ZREM', arrivalKey, staleRequestID)
+				redis.call('ZREM', originalDeadlineKey, staleRequestID)
+			end
 		end
 
 		if redis.call('ZSCORE', standardKey, requestID) ~= false then
@@ -45,59 +69,93 @@ var (
 			redis.call('ZREM', deadlineKey, requestID)
 			redis.call('ZADD', standardKey, expiresAt, requestID)
 			redis.call('PEXPIRE', standardKey, ttlMs * 2)
-			return {1, 1, 0}
+			return {1, 1, 0, 0, 0}
 		end
 
+		local convertingExtra = false
 		if redis.call('ZSCORE', extraKey, requestID) ~= false then
-			if standardLimit > 0 and redis.call('ZCARD', standardKey) < standardLimit then
+			if draining or extraLimit <= 0 then
+				redis.call('ZREM', extraKey, requestID)
+				convertingExtra = true
+			elseif standardLimit > 0 and legacyStandardCount + redis.call('ZCARD', standardKey) < standardLimit then
 				redis.call('ZREM', extraKey, requestID)
 				redis.call('ZREM', queueKey, requestID)
 				redis.call('ZREM', deadlineKey, requestID)
 				redis.call('ZADD', standardKey, expiresAt, requestID)
 				redis.call('PEXPIRE', standardKey, ttlMs * 2)
-				return {1, 1, 0}
+				return {1, 1, 0, 0, 0}
+			else
+				redis.call('ZADD', extraKey, expiresAt, requestID)
+				redis.call('PEXPIRE', extraKey, ttlMs * 2)
+				return {1, 2, 0, 0, 0}
 			end
-
-			redis.call('ZADD', extraKey, expiresAt, requestID)
-			redis.call('PEXPIRE', extraKey, ttlMs * 2)
-			return {1, 2, 0}
 		end
 
-		if redis.call('ZSCORE', queueKey, requestID) == false then
-			if maxWaiting > 0 and redis.call('ZCARD', queueKey) >= maxWaiting then
-				return {0, 0, 1}
+		local queued = redis.call('ZSCORE', queueKey, requestID)
+		local originalDeadline = redis.call('ZSCORE', originalDeadlineKey, requestID)
+		if originalDeadline ~= false and tonumber(originalDeadline) <= nowMs then
+			redis.call('ZREM', queueKey, requestID)
+			redis.call('ZREM', deadlineKey, requestID)
+			redis.call('ZREM', arrivalKey, requestID)
+			return {0, 0, 0, 0, 1}
+		end
+		if not convertingExtra and queued == false and draining then
+			return {0, 0, 0, 1, 0}
+		end
+
+		if standardLimit <= 0 then
+			redis.call('ZREM', queueKey, requestID)
+			redis.call('ZREM', deadlineKey, requestID)
+			redis.call('ZREM', arrivalKey, requestID)
+			redis.call('ZREM', originalDeadlineKey, requestID)
+			return {1, 1, 0, 0, 0}
+		end
+
+		if queued == false then
+			if not convertingExtra and maxWaiting > 0 and redis.call('ZCARD', queueKey) >= maxWaiting then
+				return {0, 0, 1, 0, 0}
 			end
-			local sequence = redis.call('INCR', sequenceKey)
+			local sequence = redis.call('ZSCORE', arrivalKey, requestID)
+			if sequence == false then
+				sequence = redis.call('INCR', sequenceKey)
+				redis.call('ZADD', arrivalKey, sequence, requestID)
+			end
 			redis.call('ZADD', queueKey, sequence, requestID)
 		end
 		if redis.call('ZSCORE', deadlineKey, requestID) == false then
-			redis.call('ZADD', deadlineKey, nowMs + waitTimeoutMs, requestID)
+			if originalDeadline == false then
+				originalDeadline = nowMs + waitTimeoutMs
+				redis.call('ZADD', originalDeadlineKey, originalDeadline, requestID)
+			end
+			redis.call('ZADD', deadlineKey, originalDeadline, requestID)
 		end
 		redis.call('PEXPIRE', queueKey, ttlMs * 2)
 		redis.call('PEXPIRE', sequenceKey, ttlMs * 2)
 		redis.call('PEXPIRE', deadlineKey, ttlMs * 2)
+		redis.call('PEXPIRE', arrivalKey, ttlMs * 2)
+		redis.call('PEXPIRE', originalDeadlineKey, ttlMs * 2)
 		local queueHead = redis.call('ZRANGE', queueKey, 0, 0)[1]
 		if queueHead ~= requestID then
-			return {0, 0, 0}
+			return {0, 0, 0, 0, 0}
 		end
 
-		if standardLimit > 0 and redis.call('ZCARD', standardKey) < standardLimit then
+		if standardLimit > 0 and legacyStandardCount + redis.call('ZCARD', standardKey) < standardLimit then
 			redis.call('ZADD', standardKey, expiresAt, requestID)
 			redis.call('ZREM', queueKey, requestID)
 			redis.call('ZREM', deadlineKey, requestID)
 			redis.call('PEXPIRE', standardKey, ttlMs * 2)
-			return {1, 1, 0}
+			return {1, 1, 0, 0, 0}
 		end
 
-		if extraLimit > 0 and redis.call('ZCARD', extraKey) < extraLimit then
+		if not draining and extraLimit > 0 and redis.call('ZCARD', extraKey) < extraLimit then
 			redis.call('ZADD', extraKey, expiresAt, requestID)
 			redis.call('ZREM', queueKey, requestID)
 			redis.call('ZREM', deadlineKey, requestID)
 			redis.call('PEXPIRE', extraKey, ttlMs * 2)
-			return {1, 2, 0}
+			return {1, 2, 0, 0, 0}
 		end
 
-		return {0, 0, 0}
+		return {0, 0, 0, 0, 0}
 	`)
 
 	releaseGatewayUserLeaseScript = redis.NewScript(`
@@ -105,6 +163,8 @@ var (
 		redis.call('ZREM', KEYS[2], ARGV[1])
 		redis.call('ZREM', KEYS[3], ARGV[1])
 		redis.call('ZREM', KEYS[5], ARGV[1])
+		redis.call('ZREM', KEYS[6], ARGV[1])
+		redis.call('ZREM', KEYS[7], ARGV[1])
 		return 1
 	`)
 
@@ -134,6 +194,7 @@ var (
 		local extraQueueKey = KEYS[4]
 		local sequenceKey = KEYS[5]
 		local deadlineKey = KEYS[6]
+		local drainKey = KEYS[7]
 		local requestID = ARGV[1]
 		local class = tonumber(ARGV[2])
 		local platformCapacity = tonumber(ARGV[3])
@@ -153,6 +214,9 @@ var (
 		local expiresAt = nowMs + ttlMs
 		redis.call('ZREMRANGEBYSCORE', platformKey, '-inf', nowMs)
 		redis.call('ZREMRANGEBYSCORE', accountKey, '-inf', nowSeconds - ttlSeconds)
+		if class == 2 and redis.call('EXISTS', drainKey) > 0 then
+			return 3
+		end
 
 		local hasPlatformLease = redis.call('ZSCORE', platformKey, requestID) ~= false
 		local hasAccountLease = redis.call('ZSCORE', accountKey, requestID) ~= false
@@ -266,6 +330,44 @@ var (
 		return 1
 	`)
 
+	beginGatewayTargetDispatchScript = redis.NewScript(`
+		redis.replicate_commands()
+		local platformKey = KEYS[1]
+		local accountKey = KEYS[2]
+		local drainKey = KEYS[3]
+		local requestID = ARGV[1]
+		local class = tonumber(ARGV[2])
+		local unlimited = tonumber(ARGV[3]) == 1
+		local ttlMs = tonumber(ARGV[4])
+		local ttlSeconds = math.max(math.ceil(ttlMs / 1000), 1)
+
+		if class == 2 and redis.call('EXISTS', drainKey) > 0 then
+			return 2
+		end
+		if unlimited then
+			return 1
+		end
+
+		local nowParts = redis.call('TIME')
+		local nowSeconds = tonumber(nowParts[1])
+		local nowPreciseSeconds = nowSeconds + tonumber(nowParts[2]) / 1000000
+		local nowMs = nowSeconds * 1000 + math.floor(tonumber(nowParts[2]) / 1000)
+		local platformExpiry = redis.call('ZSCORE', platformKey, requestID)
+		local accountLastSeen = redis.call('ZSCORE', accountKey, requestID)
+		if platformExpiry == false or accountLastSeen == false or
+			tonumber(platformExpiry) <= nowMs or tonumber(accountLastSeen) <= nowSeconds - ttlSeconds then
+			redis.call('ZREM', platformKey, requestID)
+			redis.call('ZREM', accountKey, requestID)
+			return 0
+		end
+
+		redis.call('ZADD', platformKey, nowMs + ttlMs, requestID)
+		redis.call('ZADD', accountKey, nowPreciseSeconds, requestID)
+		redis.call('PEXPIRE', platformKey, ttlMs * 2)
+		redis.call('EXPIRE', accountKey, ttlSeconds)
+		return 1
+	`)
+
 	releaseGatewayTargetLeaseScript = redis.NewScript(`
 		redis.call('ZREM', KEYS[1], ARGV[1])
 		redis.call('ZREM', KEYS[2], ARGV[1])
@@ -283,19 +385,20 @@ var (
 		local ttlMs = tonumber(ARGV[2])
 		local ttlSeconds = math.max(math.ceil(ttlMs / 1000), 1)
 
-		local hasPlatformLease = redis.call('ZSCORE', platformKey, requestID) ~= false
-		local hasAccountLease = redis.call('ZSCORE', accountKey, requestID) ~= false
-		if not hasPlatformLease or not hasAccountLease then
-			redis.call('ZREM', platformKey, requestID)
-			redis.call('ZREM', accountKey, requestID)
-			return 0
-		end
-
 		-- Keep the shared account score compatible with legacy concurrencyCache.
 		local nowParts = redis.call('TIME')
 		local nowSeconds = tonumber(nowParts[1])
 		local nowPreciseSeconds = nowSeconds + tonumber(nowParts[2]) / 1000000
 		local nowMs = nowSeconds * 1000 + math.floor(tonumber(nowParts[2]) / 1000)
+		local platformExpiry = redis.call('ZSCORE', platformKey, requestID)
+		local accountLastSeen = redis.call('ZSCORE', accountKey, requestID)
+		if platformExpiry == false or accountLastSeen == false or
+			tonumber(platformExpiry) <= nowMs or tonumber(accountLastSeen) <= nowSeconds - ttlSeconds then
+			redis.call('ZREM', platformKey, requestID)
+			redis.call('ZREM', accountKey, requestID)
+			return 0
+		end
+
 		redis.call('ZADD', platformKey, nowMs + ttlMs, requestID)
 		redis.call('ZADD', accountKey, nowPreciseSeconds, requestID)
 		redis.call('PEXPIRE', platformKey, ttlMs * 2)
@@ -305,9 +408,10 @@ var (
 )
 
 type gatewayAdmissionStore struct {
-	rdb        *redis.Client
-	leaseTTL   time.Duration
-	leaseTTLMS int64
+	rdb             *redis.Client
+	leaseTTL        time.Duration
+	leaseTTLMS      int64
+	leaseTTLSeconds int64
 }
 
 func NewGatewayAdmissionStore(rdb *redis.Client, leaseTTL time.Duration) service.GatewayAdmissionStore {
@@ -318,10 +422,12 @@ func NewGatewayAdmissionStore(rdb *redis.Client, leaseTTL time.Duration) service
 	if leaseTTLMS < 1 {
 		leaseTTLMS = 1
 	}
+	leaseTTLSeconds := (leaseTTLMS + 999) / 1000
 	return &gatewayAdmissionStore{
-		rdb:        rdb,
-		leaseTTL:   leaseTTL,
-		leaseTTLMS: leaseTTLMS,
+		rdb:             rdb,
+		leaseTTL:        leaseTTL,
+		leaseTTLMS:      leaseTTLMS,
+		leaseTTLSeconds: leaseTTLSeconds,
 	}
 }
 
@@ -339,14 +445,6 @@ func (s *gatewayAdmissionStore) TryAcquireUserLease(ctx context.Context, request
 	if request.UserID <= 0 || request.RequestID == "" {
 		return service.UserLeaseResult{}, fmt.Errorf("invalid gateway admission user lease request")
 	}
-	if request.StandardLimit <= 0 {
-		return service.UserLeaseResult{
-			Acquired:  true,
-			Class:     service.AdmissionClassStandard,
-			Unlimited: true,
-		}, nil
-	}
-
 	standardLimit := request.StandardLimit
 	extraLimit := max(request.ExtraLimit, 0)
 	waitTimeoutMS := request.WaitTimeout.Milliseconds()
@@ -363,17 +461,21 @@ func (s *gatewayAdmissionStore) TryAcquireUserLease(ctx context.Context, request
 		s.leaseTTLMS,
 		max(request.MaxWaiting, 0),
 		waitTimeoutMS,
+		s.leaseTTLSeconds,
 	).Int64Slice()
 	if err != nil {
 		return service.UserLeaseResult{}, fmt.Errorf("acquire gateway admission user lease: %w", err)
 	}
-	if len(values) != 3 {
+	if len(values) != 5 {
 		return service.UserLeaseResult{}, fmt.Errorf("acquire gateway admission user lease: unexpected result length %d", len(values))
 	}
 
 	result := service.UserLeaseResult{
 		Acquired:  values[0] == 1,
+		Unlimited: values[0] == 1 && request.StandardLimit <= 0,
 		QueueFull: values[2] == 1,
+		Draining:  values[3] == 1,
+		Expired:   values[4] == 1,
 	}
 	switch values[1] {
 	case 1:
@@ -474,6 +576,7 @@ func (s *gatewayAdmissionStore) TryAcquireTargetLease(ctx context.Context, reque
 	return service.TargetLeaseResult{
 		Acquired: decision == 1,
 		Expired:  decision == 2,
+		Draining: decision == 3,
 	}, nil
 }
 
@@ -493,6 +596,41 @@ func (s *gatewayAdmissionStore) ReleaseTargetLease(ctx context.Context, platform
 		return fmt.Errorf("release gateway admission target lease: %w", err)
 	}
 	return nil
+}
+
+// BeginTargetDispatch establishes the Redis ordering point between dispatch and the global drain.
+func (s *gatewayAdmissionStore) BeginTargetDispatch(ctx context.Context, request service.TargetDispatchRequest) (service.TargetDispatchResult, error) {
+	if s == nil || s.rdb == nil {
+		return service.TargetDispatchResult{}, fmt.Errorf("gateway admission store is unavailable")
+	}
+	if request.RequestID == "" || request.Platform == "" || request.AccountID <= 0 {
+		return service.TargetDispatchResult{}, fmt.Errorf("invalid gateway admission target dispatch request")
+	}
+	classCode, err := gatewayAdmissionClassCode(request.Class)
+	if err != nil {
+		return service.TargetDispatchResult{}, err
+	}
+	keys := gatewayAdmissionTargetLeaseKeys(request.Platform, request.AccountID)
+	unlimitedFlag := 0
+	if request.Unlimited {
+		unlimitedFlag = 1
+	}
+	decision, err := beginGatewayTargetDispatchScript.Run(
+		ctx,
+		s.rdb,
+		[]string{keys[0], keys[1], keys[6]},
+		request.RequestID,
+		classCode,
+		unlimitedFlag,
+		s.leaseTTLMS,
+	).Int64()
+	if err != nil {
+		return service.TargetDispatchResult{}, fmt.Errorf("begin gateway admission target dispatch: %w", err)
+	}
+	return service.TargetDispatchResult{
+		Started:  decision == 1,
+		Draining: decision == 2,
+	}, nil
 }
 
 func (s *gatewayAdmissionStore) RenewTargetLease(ctx context.Context, platform string, accountID int64, requestID string) (bool, error) {
@@ -536,6 +674,10 @@ func gatewayAdmissionUserLeaseKeys(userID int64) []string {
 		prefix + "queue",
 		prefix + "queue:sequence",
 		prefix + "queue:deadline",
+		prefix + "queue:arrival",
+		prefix + "queue:original_deadline",
+		userSlotKey(userID),
+		extraConcurrencyAdmissionDrainKey,
 	}
 }
 
@@ -548,5 +690,6 @@ func gatewayAdmissionTargetLeaseKeys(platform string, accountID int64) []string 
 		platformPrefix + "queue:extra",
 		platformPrefix + "queue:sequence",
 		platformPrefix + "queue:deadline",
+		extraConcurrencyAdmissionDrainKey,
 	}
 }

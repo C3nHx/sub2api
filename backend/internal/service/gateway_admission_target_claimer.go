@@ -77,6 +77,10 @@ func (c *gatewayAdmissionTargetClaimer) TryClaim(ctx context.Context, target Tar
 		c.setTerminalError(gatewayAdmissionWaitTimeoutError(c.class, "account"))
 		return nil, false, nil
 	}
+	if result.Draining {
+		c.setTerminalError(ErrGatewayAdmissionDraining)
+		return nil, false, nil
+	}
 	if !result.Acquired {
 		return nil, false, nil
 	}

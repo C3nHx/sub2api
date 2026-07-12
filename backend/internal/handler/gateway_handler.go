@@ -241,12 +241,17 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			ExtraLimit:    subject.ExtraConcurrency,
 			Settings:      extraSettings,
 		})
-		if err == nil {
+		if errors.Is(err, service.ErrGatewayAdmissionDraining) {
+			useExtraAdmission = false
+			err = nil
+		}
+		if useExtraAdmission && err == nil {
 			release := h.concurrencyHelper.withAPIKeySlotFromGin(c, extraAdmission.Close)
 			release = wrapReleaseOnDone(c.Request.Context(), release)
 			defer release()
 		}
-	} else {
+	}
+	if !useExtraAdmission {
 		// Feature-off compatibility is structural: retain the legacy helper path.
 		admission, err = h.concurrencyHelper.Begin(c, UserAdmissionRequest{
 			UserID:         subject.UserID,
@@ -394,23 +399,22 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			} else {
 				account = selection.Account
 			}
-			setOpsSelectedAccount(c, account.ID, account.Platform)
-
-			// 检查请求拦截（预热请求、SUGGESTION MODE等）
-			if account.IsInterceptWarmupEnabled() {
-				interceptType := detectInterceptType(body, reqModel, parsedReq.MaxTokens, isClaudeCodeClient)
-				if interceptType != InterceptTypeNone {
-					if useExtraAdmission {
-						extraAdmission.ReleaseTarget()
-					} else if selection.Acquired && selection.ReleaseFunc != nil {
-						selection.ReleaseFunc()
+			if !useExtraAdmission {
+				setOpsSelectedAccount(c, account.ID, account.Platform)
+				// 检查请求拦截（预热请求、SUGGESTION MODE等）
+				if account.IsInterceptWarmupEnabled() {
+					interceptType := detectInterceptType(body, reqModel, parsedReq.MaxTokens, isClaudeCodeClient)
+					if interceptType != InterceptTypeNone {
+						if selection.Acquired && selection.ReleaseFunc != nil {
+							selection.ReleaseFunc()
+						}
+						if reqStream {
+							sendMockInterceptStream(c, reqModel, interceptType)
+						} else {
+							sendMockInterceptResponse(c, reqModel, interceptType)
+						}
+						return
 					}
-					if reqStream {
-						sendMockInterceptStream(c, reqModel, interceptType)
-					} else {
-						sendMockInterceptResponse(c, reqModel, interceptType)
-					}
-					return
 				}
 			}
 
@@ -492,9 +496,26 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				}
 			}
 			var billingRecheckErr error
+			preparationHandled := false
 			if useExtraAdmission {
-				err = admittedTarget.Dispatch(
+				preparationHandled, err = admittedTarget.DispatchPrepared(
 					requestCtx,
+					func(_ context.Context, targetAccount *service.Account) (service.GatewayTargetPreparation, error) {
+						if !targetAccount.IsInterceptWarmupEnabled() {
+							return service.GatewayTargetPreparation{}, nil
+						}
+						interceptType := detectInterceptType(body, reqModel, parsedReq.MaxTokens, isClaudeCodeClient)
+						if interceptType == InterceptTypeNone {
+							return service.GatewayTargetPreparation{}, nil
+						}
+						setOpsSelectedAccount(c, targetAccount.ID, targetAccount.Platform)
+						if reqStream {
+							sendMockInterceptStream(c, reqModel, interceptType)
+						} else {
+							sendMockInterceptResponse(c, reqModel, interceptType)
+						}
+						return service.GatewayTargetPreparation{Handled: true}, nil
+					},
 					func(ctx context.Context) error {
 						billingRecheckErr = h.billingCacheService.RecheckBillingEligibility(
 							ctx,
@@ -506,11 +527,21 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 						)
 						return billingRecheckErr
 					},
-					forwardSameAccount,
+					func(ctx context.Context, targetAccount *service.Account) error {
+						account = targetAccount
+						ctx = setOpsSelectedAccountContext(c, ctx, targetAccount.ID, targetAccount.Platform)
+						return forwardSameAccount(ctx, targetAccount)
+					},
 				)
+				if admittedTarget.Account != nil {
+					account = admittedTarget.Account
+				}
 			} else {
 				err = forwardSameAccount(requestCtx, account)
 				admission.ReleaseAccount()
+			}
+			if preparationHandled {
+				return
 			}
 			if sameAccountRetryCanceled {
 				return
@@ -522,6 +553,11 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					c.Header("Retry-After", strconv.Itoa(retryAfter))
 				}
 				h.handleStreamingAwareError(c, status, code, message, streamStarted)
+				return
+			}
+			if useExtraAdmission && isGatewayAdmissionConcurrencyError(err) {
+				reqLog.Warn("gateway.extra_admission_dispatch_failed", zap.Error(err))
+				h.handleConcurrencyError(c, err, "account", streamStarted)
 				return
 			}
 			if err != nil {
@@ -732,33 +768,32 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			} else {
 				account = selection.Account
 			}
-			setOpsSelectedAccount(c, account.ID, account.Platform)
-
-			// [DEBUG-STICKY] 打印账号选择结果
-			reqLog.Info("sticky.account_selected",
-				zap.Int64("selected_account_id", account.ID),
-				zap.String("account_name", account.Name),
-				zap.Bool("slot_acquired", useExtraAdmission || selection.Acquired),
-				zap.Bool("has_wait_plan", !useExtraAdmission && selection.WaitPlan != nil),
-				zap.Int64("sticky_bound_account_id", sessionBoundAccountID),
-				zap.Bool("sticky_honored", sessionBoundAccountID > 0 && sessionBoundAccountID == account.ID),
-			)
-
-			// 检查请求拦截（预热请求、SUGGESTION MODE等）
-			if account.IsInterceptWarmupEnabled() {
-				interceptType := detectInterceptType(body, reqModel, parsedReq.MaxTokens, isClaudeCodeClient)
-				if interceptType != InterceptTypeNone {
-					if useExtraAdmission {
-						extraAdmission.ReleaseTarget()
-					} else if selection.Acquired && selection.ReleaseFunc != nil {
-						selection.ReleaseFunc()
+			logSelectedAccount := func(targetAccount *service.Account, slotAcquired, hasWaitPlan bool) {
+				reqLog.Info("sticky.account_selected",
+					zap.Int64("selected_account_id", targetAccount.ID),
+					zap.String("account_name", targetAccount.Name),
+					zap.Bool("slot_acquired", slotAcquired),
+					zap.Bool("has_wait_plan", hasWaitPlan),
+					zap.Int64("sticky_bound_account_id", sessionBoundAccountID),
+					zap.Bool("sticky_honored", sessionBoundAccountID > 0 && sessionBoundAccountID == targetAccount.ID),
+				)
+			}
+			if !useExtraAdmission {
+				setOpsSelectedAccount(c, account.ID, account.Platform)
+				logSelectedAccount(account, selection.Acquired, selection.WaitPlan != nil)
+				if account.IsInterceptWarmupEnabled() {
+					interceptType := detectInterceptType(body, reqModel, parsedReq.MaxTokens, isClaudeCodeClient)
+					if interceptType != InterceptTypeNone {
+						if selection.Acquired && selection.ReleaseFunc != nil {
+							selection.ReleaseFunc()
+						}
+						if reqStream {
+							sendMockInterceptStream(c, reqModel, interceptType)
+						} else {
+							sendMockInterceptResponse(c, reqModel, interceptType)
+						}
+						return
 					}
-					if reqStream {
-						sendMockInterceptStream(c, reqModel, interceptType)
-					} else {
-						sendMockInterceptResponse(c, reqModel, interceptType)
-					}
-					return
 				}
 			}
 
@@ -795,56 +830,6 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				}
 			}
 
-			// ===== 用户消息串行队列 START =====
-			var queueRelease func()
-			umqMode := h.getUserMsgQueueMode(account, attemptParsedReq)
-
-			switch umqMode {
-			case config.UMQModeSerialize:
-				// 串行模式：获取锁 + RPM 延迟 + 释放（当前行为不变）
-				baseRPM := account.GetBaseRPM()
-				release, qErr := h.userMsgQueueHelper.AcquireWithWait(
-					c, account.ID, baseRPM, reqStream, &streamStarted,
-					h.cfg.Gateway.UserMessageQueue.WaitTimeout(),
-					reqLog,
-				)
-				if qErr != nil {
-					// fail-open: 记录 warn，不阻止请求
-					reqLog.Warn("gateway.umq_acquire_failed",
-						zap.Int64("account_id", account.ID),
-						zap.Error(qErr),
-					)
-				} else {
-					queueRelease = release
-				}
-
-			case config.UMQModeThrottle:
-				// 软性限速：仅施加 RPM 自适应延迟，不阻塞并发
-				baseRPM := account.GetBaseRPM()
-				if tErr := h.userMsgQueueHelper.ThrottleWithPing(
-					c, account.ID, baseRPM, reqStream, &streamStarted,
-					h.cfg.Gateway.UserMessageQueue.WaitTimeout(),
-					reqLog,
-				); tErr != nil {
-					reqLog.Warn("gateway.umq_throttle_failed",
-						zap.Int64("account_id", account.ID),
-						zap.Error(tErr),
-					)
-				}
-
-			default:
-				if umqMode != "" {
-					reqLog.Warn("gateway.umq_unknown_mode",
-						zap.String("mode", umqMode),
-						zap.Int64("account_id", account.ID),
-					)
-				}
-			}
-
-			// 用 wrapReleaseOnDone 确保 context 取消时自动释放（仅 serialize 模式有 queueRelease）
-			queueRelease = wrapReleaseOnDone(c.Request.Context(), queueRelease)
-			// ===== 用户消息串行队列 END =====
-
 			// 渠道模型映射只作用于本次账号尝试，避免 failover 后污染原始 ParsedRequest。
 			if channelMapping.Mapped {
 				attemptParsedReq.Model = channelMapping.MappedModel
@@ -853,13 +838,103 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					return
 				}
 			}
-			// Bedrock CC 兼容：清理 body 专有字段 + 过滤 anthropic-beta header，适用于所有转发路径
-			if err := attemptParsedReq.ReplaceBody(h.gatewayService.ApplyBedrockCCCompat(c, attemptParsedReq.Body.Bytes(), attemptParsedReq.Model, account, apiKey.GroupID)); err != nil {
-				h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
-				return
+			canonicalTemplate := attemptParsedReq
+			canonicalTemplateBody := append([]byte(nil), attemptParsedReq.Body.Bytes()...)
+			originalBetaHeader := append([]string(nil), c.Request.Header.Values("anthropic-beta")...)
+			restoreBetaHeader := func() {
+				c.Request.Header.Del("anthropic-beta")
+				for _, value := range originalBetaHeader {
+					c.Request.Header.Add("anthropic-beta", value)
+				}
 			}
-			attemptTemplate := attemptParsedReq
-			attemptTemplateBody := append([]byte(nil), attemptParsedReq.Body.Bytes()...)
+
+			var (
+				attemptTemplate     *service.ParsedRequest
+				attemptTemplateBody []byte
+				queueRelease        func()
+				preparationErr      error
+			)
+			prepareTarget := func(_ context.Context, targetAccount *service.Account) (service.GatewayTargetPreparation, error) {
+				restoreBetaHeader()
+				if useExtraAdmission && targetAccount.IsInterceptWarmupEnabled() {
+					interceptType := detectInterceptType(body, reqModel, parsedReq.MaxTokens, isClaudeCodeClient)
+					if interceptType != InterceptTypeNone {
+						setOpsSelectedAccount(c, targetAccount.ID, targetAccount.Platform)
+						logSelectedAccount(targetAccount, true, false)
+						if reqStream {
+							sendMockInterceptStream(c, reqModel, interceptType)
+						} else {
+							sendMockInterceptResponse(c, reqModel, interceptType)
+						}
+						return service.GatewayTargetPreparation{Handled: true}, nil
+					}
+				}
+
+				preparedRequest, cloneErr := canonicalTemplate.CloneForBody(canonicalTemplateBody)
+				if cloneErr != nil {
+					return service.GatewayTargetPreparation{Cleanup: restoreBetaHeader}, cloneErr
+				}
+				var preparedQueueRelease func()
+				preparationRecheck := false
+				umqMode := h.getUserMsgQueueMode(targetAccount, preparedRequest)
+				switch umqMode {
+				case config.UMQModeSerialize:
+					preparationRecheck = true
+					baseRPM := targetAccount.GetBaseRPM()
+					release, qErr := h.userMsgQueueHelper.AcquireWithWait(
+						c, targetAccount.ID, baseRPM, reqStream, &streamStarted,
+						h.cfg.Gateway.UserMessageQueue.WaitTimeout(),
+						reqLog,
+					)
+					if qErr != nil {
+						reqLog.Warn("gateway.umq_acquire_failed", zap.Int64("account_id", targetAccount.ID), zap.Error(qErr))
+					} else {
+						preparedQueueRelease = release
+					}
+				case config.UMQModeThrottle:
+					preparationRecheck = true
+					baseRPM := targetAccount.GetBaseRPM()
+					if tErr := h.userMsgQueueHelper.ThrottleWithPing(
+						c, targetAccount.ID, baseRPM, reqStream, &streamStarted,
+						h.cfg.Gateway.UserMessageQueue.WaitTimeout(), reqLog,
+					); tErr != nil {
+						reqLog.Warn("gateway.umq_throttle_failed", zap.Int64("account_id", targetAccount.ID), zap.Error(tErr))
+					}
+				default:
+					if umqMode != "" {
+						reqLog.Warn("gateway.umq_unknown_mode", zap.String("mode", umqMode), zap.Int64("account_id", targetAccount.ID))
+					}
+				}
+				preparedQueueRelease = wrapReleaseOnDone(c.Request.Context(), preparedQueueRelease)
+				cleanup := func() {
+					preparedRequest.OnUpstreamAccepted = nil
+					if preparedQueueRelease != nil {
+						preparedQueueRelease()
+					}
+					restoreBetaHeader()
+				}
+
+				if replaceErr := preparedRequest.ReplaceBody(h.gatewayService.ApplyBedrockCCCompat(
+					c, preparedRequest.Body.Bytes(), preparedRequest.Model, targetAccount, apiKey.GroupID,
+				)); replaceErr != nil {
+					return service.GatewayTargetPreparation{Cleanup: cleanup, Recheck: preparationRecheck}, replaceErr
+				}
+				attemptTemplate = preparedRequest
+				attemptTemplateBody = append([]byte(nil), preparedRequest.Body.Bytes()...)
+				queueRelease = preparedQueueRelease
+				return service.GatewayTargetPreparation{Cleanup: cleanup, Recheck: preparationRecheck}, nil
+			}
+
+			var legacyPreparationCleanup func()
+			if !useExtraAdmission {
+				preparation, prepareErr := prepareTarget(c.Request.Context(), account)
+				if prepareErr != nil {
+					preparation.Cleanup()
+					h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
+					return
+				}
+				legacyPreparationCleanup = preparation.Cleanup
+			}
 
 			// 转发请求 - 根据账号平台分流
 			var result *service.ForwardResult
@@ -908,9 +983,15 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				}
 			}
 			var billingRecheckErr error
+			preparationHandled := false
 			if useExtraAdmission {
-				err = admittedTarget.Dispatch(
+				preparationHandled, err = admittedTarget.DispatchPrepared(
 					requestCtx,
+					func(ctx context.Context, targetAccount *service.Account) (service.GatewayTargetPreparation, error) {
+						preparation, prepareErr := prepareTarget(ctx, targetAccount)
+						preparationErr = prepareErr
+						return preparation, prepareErr
+					},
 					func(ctx context.Context) error {
 						billingRecheckErr = h.billingCacheService.RecheckBillingEligibility(
 							ctx,
@@ -922,21 +1003,32 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 						)
 						return billingRecheckErr
 					},
-					forwardSameAccount,
+					func(ctx context.Context, targetAccount *service.Account) error {
+						account = targetAccount
+						ctx = setOpsSelectedAccountContext(c, ctx, targetAccount.ID, targetAccount.Platform)
+						logSelectedAccount(targetAccount, true, false)
+						return forwardSameAccount(ctx, targetAccount)
+					},
 				)
+				if admittedTarget.Account != nil {
+					account = admittedTarget.Account
+				}
 			} else {
 				err = forwardSameAccount(requestCtx, account)
 			}
 
-			// 兜底释放串行锁（正常情况已通过回调提前释放）
-			if queueRelease != nil {
-				queueRelease()
-			}
-			// 清理回调引用，防止 failover 重试时旧回调被错误调用
-			attemptParsedReq.OnUpstreamAccepted = nil
-
 			if !useExtraAdmission {
+				if legacyPreparationCleanup != nil {
+					legacyPreparationCleanup()
+				}
 				admission.ReleaseAccount()
+			}
+			if preparationHandled {
+				return
+			}
+			if preparationErr != nil {
+				h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
+				return
 			}
 			if sameAccountRetryCanceled {
 				return
@@ -948,6 +1040,11 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					c.Header("Retry-After", strconv.Itoa(retryAfter))
 				}
 				h.handleStreamingAwareError(c, status, code, message, streamStarted)
+				return
+			}
+			if useExtraAdmission && isGatewayAdmissionConcurrencyError(err) {
+				reqLog.Warn("gateway.extra_admission_dispatch_failed", zap.Error(err))
+				h.handleConcurrencyError(c, err, "account", streamStarted)
 				return
 			}
 			if err != nil {

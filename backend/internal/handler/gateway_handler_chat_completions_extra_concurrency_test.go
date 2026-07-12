@@ -88,6 +88,12 @@ func (s *chatCompletionsTargetLeaseStore) TryAcquireTargetLease(_ context.Contex
 	return service.TargetLeaseResult{Acquired: s.targetRequestID == request.RequestID}, nil
 }
 
+func (s *chatCompletionsTargetLeaseStore) BeginTargetDispatch(_ context.Context, request service.TargetDispatchRequest) (service.TargetDispatchResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return service.TargetDispatchResult{Started: s.targetRequestID == request.RequestID}, nil
+}
+
 func (s *chatCompletionsTargetLeaseStore) RenewTargetLease(_ context.Context, _ string, _ int64, requestID string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

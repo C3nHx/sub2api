@@ -133,12 +133,17 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 			ExtraLimit:    subject.ExtraConcurrency,
 			Settings:      extraSettings,
 		})
-		if err == nil {
+		if errors.Is(err, service.ErrGatewayAdmissionDraining) {
+			useExtraAdmission = false
+			err = nil
+		}
+		if useExtraAdmission && err == nil {
 			release := h.concurrencyHelper.withAPIKeySlotFromGin(c, extraAdmission.Close)
 			release = wrapReleaseOnDone(c.Request.Context(), release)
 			defer release()
 		}
-	} else {
+	}
+	if !useExtraAdmission {
 		admission, err = h.concurrencyHelper.Begin(c, UserAdmissionRequest{
 			UserID:         subject.UserID,
 			MaxConcurrency: subject.Concurrency,
@@ -247,7 +252,9 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		} else {
 			account = selection.Account
 		}
-		setOpsSelectedAccount(c, account.ID, account.Platform)
+		if !useExtraAdmission {
+			setOpsSelectedAccount(c, account.ID, account.Platform)
+		}
 
 		// 4. Acquire account concurrency slot
 		if !useExtraAdmission {
@@ -267,7 +274,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 			}
 		}
 
-		if groupPlatform == service.PlatformGemini && account.Platform != service.PlatformGemini {
+		if !useExtraAdmission && groupPlatform == service.PlatformGemini && account.Platform != service.PlatformGemini {
 			if useExtraAdmission {
 				extraAdmission.ReleaseTarget()
 			} else {
@@ -276,7 +283,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 			fs.FailedAccountIDs[account.ID] = struct{}{}
 			continue
 		}
-		if account.Platform == service.PlatformGemini && h.geminiCompatService == nil {
+		if !useExtraAdmission && account.Platform == service.PlatformGemini && h.geminiCompatService == nil {
 			if useExtraAdmission {
 				extraAdmission.ReleaseTarget()
 			} else {
@@ -324,9 +331,23 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 				}
 			}
 		}
+		preparationHandled := false
+		preparationRetry := false
 		if useExtraAdmission {
-			err = admittedTarget.Dispatch(
+			preparationHandled, err = admittedTarget.DispatchPrepared(
 				c.Request.Context(),
+				func(_ context.Context, targetAccount *service.Account) (service.GatewayTargetPreparation, error) {
+					if groupPlatform == service.PlatformGemini && targetAccount.Platform != service.PlatformGemini {
+						fs.FailedAccountIDs[targetAccount.ID] = struct{}{}
+						preparationRetry = true
+						return service.GatewayTargetPreparation{Handled: true}, nil
+					}
+					if targetAccount.Platform == service.PlatformGemini && h.geminiCompatService == nil {
+						h.chatCompletionsErrorResponse(c, http.StatusBadGateway, "upstream_error", "Gemini compatibility service is not configured")
+						return service.GatewayTargetPreparation{Handled: true}, nil
+					}
+					return service.GatewayTargetPreparation{}, nil
+				},
 				func(ctx context.Context) error {
 					billingRecheckErr = h.billingCacheService.RecheckBillingEligibility(
 						ctx,
@@ -338,11 +359,24 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 					)
 					return billingRecheckErr
 				},
-				forwardSameAccount,
+				func(ctx context.Context, targetAccount *service.Account) error {
+					account = targetAccount
+					ctx = setOpsSelectedAccountContext(c, ctx, targetAccount.ID, targetAccount.Platform)
+					return forwardSameAccount(ctx, targetAccount)
+				},
 			)
+			if admittedTarget.Account != nil {
+				account = admittedTarget.Account
+			}
 		} else {
 			err = forward(c.Request.Context(), account)
 			admission.ReleaseAccount()
+		}
+		if preparationHandled {
+			if preparationRetry {
+				continue
+			}
+			return
 		}
 		if billingRecheckErr != nil {
 			reqLog.Info("gateway.cc.billing_recheck_failed", zap.Error(billingRecheckErr))
@@ -351,6 +385,11 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 				c.Header("Retry-After", strconv.Itoa(retryAfter))
 			}
 			h.chatCompletionsErrorResponse(c, status, code, message)
+			return
+		}
+		if useExtraAdmission && isGatewayAdmissionConcurrencyError(err) {
+			reqLog.Warn("gateway.cc.extra_admission_dispatch_failed", zap.Error(err))
+			h.handleCCConcurrencyError(c, err, "account", streamStarted)
 			return
 		}
 		if sameAccountRetryCanceled || (useExtraAdmission && errors.Is(err, context.Canceled)) {

@@ -87,6 +87,12 @@ func usageRecordContext(parent context.Context, base context.Context) context.Co
 	if requestID, _ := parent.Value(ctxkey.RequestID).(string); strings.TrimSpace(requestID) != "" {
 		base = context.WithValue(base, ctxkey.RequestID, strings.TrimSpace(requestID))
 	}
+	if accountID, _ := parent.Value(ctxkey.AccountID).(int64); accountID > 0 {
+		base = context.WithValue(base, ctxkey.AccountID, accountID)
+	}
+	if platform, _ := parent.Value(ctxkey.Platform).(string); strings.TrimSpace(platform) != "" {
+		base = context.WithValue(base, ctxkey.Platform, strings.TrimSpace(platform))
+	}
 	return base
 }
 
@@ -324,12 +330,17 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			ExtraLimit:    subject.ExtraConcurrency,
 			Settings:      extraSettings,
 		})
-		if err == nil {
+		if errors.Is(err, service.ErrGatewayAdmissionDraining) {
+			useExtraAdmission = false
+			err = nil
+		}
+		if useExtraAdmission && err == nil {
 			release := h.concurrencyHelper.withAPIKeySlotFromGin(c, extraAdmission.Close)
 			release = wrapReleaseOnDone(c.Request.Context(), release)
 			defer release()
 		}
-	} else {
+	}
+	if !useExtraAdmission {
 		var acquired bool
 		admission, acquired = h.beginResponsesAdmission(c, subject.UserID, subject.Concurrency, reqStream, &streamStarted, reqLog)
 		if !acquired {
@@ -454,22 +465,28 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			h.handleStreamingAwareError(c, cls.Status, cls.ErrType, cls.Message, streamStarted)
 			return
 		}
-		if previousResponseID != "" && selection != nil && selection.Account != nil {
-			reqLog.Debug("openai.account_selected_with_previous_response_id", zap.Int64("account_id", selection.Account.ID))
-		}
-		reqLog.Debug("openai.account_schedule_decision",
-			zap.String("layer", scheduleDecision.Layer),
-			zap.Bool("sticky_previous_hit", scheduleDecision.StickyPreviousHit),
-			zap.Bool("sticky_session_hit", scheduleDecision.StickySessionHit),
-			zap.Int("candidate_count", scheduleDecision.CandidateCount),
-			zap.Int("top_k", scheduleDecision.TopK),
-			zap.Int64("latency_ms", scheduleDecision.LatencyMs),
-			zap.Float64("load_skew", scheduleDecision.LoadSkew),
-		)
 		account := selection.Account
-		sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
-		reqLog.Debug("openai.account_selected", zap.Int64("account_id", account.ID), zap.String("account_name", account.Name))
-		setOpsSelectedAccount(c, account.ID, account.Platform)
+		commitSelectedAccount := func(targetAccount *service.Account) {
+			account = targetAccount
+			if previousResponseID != "" {
+				reqLog.Debug("openai.account_selected_with_previous_response_id", zap.Int64("account_id", targetAccount.ID))
+			}
+			reqLog.Debug("openai.account_schedule_decision",
+				zap.String("layer", scheduleDecision.Layer),
+				zap.Bool("sticky_previous_hit", scheduleDecision.StickyPreviousHit),
+				zap.Bool("sticky_session_hit", scheduleDecision.StickySessionHit),
+				zap.Int("candidate_count", scheduleDecision.CandidateCount),
+				zap.Int("top_k", scheduleDecision.TopK),
+				zap.Int64("latency_ms", scheduleDecision.LatencyMs),
+				zap.Float64("load_skew", scheduleDecision.LoadSkew),
+			)
+			sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, targetAccount)
+			reqLog.Debug("openai.account_selected", zap.Int64("account_id", targetAccount.ID), zap.String("account_name", targetAccount.Name))
+		}
+		if !useExtraAdmission {
+			commitSelectedAccount(account)
+			setOpsSelectedAccount(c, account.ID, account.Platform)
+		}
 
 		if !useExtraAdmission && !h.admitResponsesAccount(c, admission, apiKey.GroupID, sessionHash, selection, &streamStarted, reqLog) {
 			return
@@ -516,8 +533,9 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			}
 		}
 		if useExtraAdmission {
-			err = admittedTarget.Dispatch(
+			_, err = admittedTarget.DispatchPrepared(
 				c.Request.Context(),
+				nil,
 				func(ctx context.Context) error {
 					billingRecheckErr = h.billingCacheService.RecheckBillingEligibility(
 						ctx,
@@ -529,8 +547,15 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 					)
 					return billingRecheckErr
 				},
-				forwardSameAccount,
+				func(ctx context.Context, targetAccount *service.Account) error {
+					commitSelectedAccount(targetAccount)
+					ctx = setOpsSelectedAccountContext(c, ctx, targetAccount.ID, targetAccount.Platform)
+					return forwardSameAccount(ctx, targetAccount)
+				},
 			)
+			if admittedTarget.Account != nil {
+				account = admittedTarget.Account
+			}
 		} else {
 			err = func() error {
 				defer admission.ReleaseAccount()
@@ -544,6 +569,11 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				c.Header("Retry-After", strconv.Itoa(retryAfter))
 			}
 			h.handleStreamingAwareError(c, status, code, message, streamStarted)
+			return
+		}
+		if useExtraAdmission && isGatewayAdmissionConcurrencyError(err) {
+			reqLog.Warn("openai.extra_admission_dispatch_failed", zap.Error(err))
+			h.handleConcurrencyError(c, err, "account", streamStarted)
 			return
 		}
 		if c.Request.Context().Err() != nil {
@@ -919,12 +949,17 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			ExtraLimit:    subject.ExtraConcurrency,
 			Settings:      extraSettings,
 		})
-		if err == nil {
+		if errors.Is(err, service.ErrGatewayAdmissionDraining) {
+			useExtraAdmission = false
+			err = nil
+		}
+		if useExtraAdmission && err == nil {
 			release := h.concurrencyHelper.withAPIKeySlotFromGin(c, extraAdmission.Close)
 			release = wrapReleaseOnDone(c.Request.Context(), release)
 			defer release()
 		}
-	} else {
+	}
+	if !useExtraAdmission {
 		var acquired bool
 		admission, acquired = h.beginResponsesAdmission(c, subject.UserID, subject.Concurrency, reqStream, &streamStarted, reqLog)
 		if !acquired {
@@ -1053,10 +1088,16 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			return
 		}
 		account := selection.Account
-		sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
-		reqLog.Debug("openai_messages.account_selected", zap.Int64("account_id", account.ID), zap.String("account_name", account.Name))
 		_ = scheduleDecision
-		setOpsSelectedAccount(c, account.ID, account.Platform)
+		commitSelectedAccount := func(targetAccount *service.Account) {
+			account = targetAccount
+			sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, targetAccount)
+			reqLog.Debug("openai_messages.account_selected", zap.Int64("account_id", targetAccount.ID), zap.String("account_name", targetAccount.Name))
+		}
+		if !useExtraAdmission {
+			commitSelectedAccount(account)
+			setOpsSelectedAccount(c, account.ID, account.Platform)
+		}
 
 		if !useExtraAdmission && !h.admitResponsesAccount(c, admission, apiKey.GroupID, sessionHash, selection, &streamStarted, reqLog) {
 			return
@@ -1104,8 +1145,9 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 					}
 				}
 			}
-			err = admittedTarget.Dispatch(
+			_, err = admittedTarget.DispatchPrepared(
 				c.Request.Context(),
+				nil,
 				func(ctx context.Context) error {
 					billingRecheckErr = h.billingCacheService.RecheckBillingEligibility(
 						ctx,
@@ -1117,8 +1159,15 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 					)
 					return billingRecheckErr
 				},
-				forwardSameAccount,
+				func(ctx context.Context, targetAccount *service.Account) error {
+					commitSelectedAccount(targetAccount)
+					ctx = setOpsSelectedAccountContext(c, ctx, targetAccount.ID, targetAccount.Platform)
+					return forwardSameAccount(ctx, targetAccount)
+				},
 			)
+			if admittedTarget.Account != nil {
+				account = admittedTarget.Account
+			}
 		} else {
 			result, err = func() (*service.OpenAIForwardResult, error) {
 				defer admission.ReleaseAccount()
@@ -1131,6 +1180,12 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			if retryAfter > 0 {
 				c.Header("Retry-After", strconv.Itoa(retryAfter))
 			}
+			h.anthropicStreamingAwareError(c, status, code, message, streamStarted)
+			return
+		}
+		if useExtraAdmission && isGatewayAdmissionConcurrencyError(err) {
+			reqLog.Warn("openai_messages.extra_admission_dispatch_failed", zap.Error(err))
+			status, code, message := concurrencyErrorResponse(err, "account")
 			h.anthropicStreamingAwareError(c, status, code, message, streamStarted)
 			return
 		}
@@ -1389,13 +1444,6 @@ func (h *OpenAIGatewayHandler) beginResponsesAdmission(
 	return admission, true
 }
 
-func isGatewayAdmissionConcurrencyError(err error) bool {
-	var extraUnavailable *service.ExtraConcurrencyUnavailableError
-	var timeout *service.GatewayAdmissionTimeoutError
-	var queueFull *service.GatewayAdmissionQueueFullError
-	return errors.As(err, &extraUnavailable) || errors.As(err, &timeout) || errors.As(err, &queueFull)
-}
-
 func (h *OpenAIGatewayHandler) admitResponsesAccount(
 	c *gin.Context,
 	admission *RequestAdmission,
@@ -1565,12 +1613,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	if requestPlatform == service.PlatformGrok {
 		requiredTransport = service.OpenAIUpstreamTransportHTTPSSE
 	}
+	extraAdmissionAvailable := (requestPlatform == service.PlatformOpenAI || requestPlatform == service.PlatformGrok) &&
+		h.gatewayAdmission != nil && h.settingService != nil
 	extraSettings := service.ExtraConcurrencyRuntimeSettings{}
 	useExtraAdmission := false
-	if (requestPlatform == service.PlatformOpenAI || requestPlatform == service.PlatformGrok) && h.gatewayAdmission != nil && h.settingService != nil {
-		extraSettings = h.settingService.GetExtraConcurrencyRuntimeSettings(ctx)
-		useExtraAdmission = extraSettings.Enabled
-	}
 
 	var (
 		admissionMu           sync.Mutex
@@ -1634,6 +1680,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	defer releaseTurnSlots()
 
 	beginTurnAdmissionLocked := func(turnCtx context.Context, logEvent string) error {
+		extraSettings = service.ExtraConcurrencyRuntimeSettings{}
+		useExtraAdmission = false
+		if extraAdmissionAvailable {
+			extraSettings = h.settingService.GetExtraConcurrencyRuntimeSettings(turnCtx)
+			useExtraAdmission = extraSettings.Enabled
+		}
 		if useExtraAdmission {
 			admission, err := h.gatewayAdmission.Begin(turnCtx, service.GatewayAdmissionRequest{
 				UserID:        subject.UserID,
@@ -1641,6 +1693,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				ExtraLimit:    subject.ExtraConcurrency,
 				Settings:      extraSettings,
 			})
+			if errors.Is(err, service.ErrGatewayAdmissionDraining) {
+				useExtraAdmission = false
+				err = nil
+			}
 			if err != nil {
 				if isGatewayAdmissionConcurrencyError(err) || errors.Is(err, context.Canceled) {
 					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "too many concurrent requests, please retry later", err)
@@ -1648,9 +1704,11 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				reqLog.Warn(logEvent, zap.Error(err))
 				return service.NewOpenAIWSClientCloseError(coderws.StatusInternalError, "failed to acquire user concurrency slot", err)
 			}
-			currentExtraAdmission = admission
-			currentExtraClose = wrapReleaseOnDone(turnCtx, h.concurrencyHelper.withAPIKeySlotFromGin(c, admission.Close))
-			return nil
+			if useExtraAdmission {
+				currentExtraAdmission = admission
+				currentExtraClose = wrapReleaseOnDone(turnCtx, h.concurrencyHelper.withAPIKeySlotFromGin(c, admission.Close))
+				return nil
+			}
 		}
 		admission, err := h.concurrencyHelper.Begin(c, UserAdmissionRequest{
 			UserID:         subject.UserID,
@@ -1678,6 +1736,34 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		if errors.As(err, &closeErr) {
 			closeOpenAIClientWS(wsConn, closeErr.StatusCode(), closeErr.Reason())
 		}
+	}
+	beginCurrentExtraAttemptLocked := func(turnCtx context.Context) error {
+		if currentAdmittedTarget == nil {
+			return service.NewOpenAIWSClientCloseError(coderws.StatusInternalError, "websocket target admission is unavailable", nil)
+		}
+		var billingRecheckErr error
+		finish, err := currentAdmittedTarget.BeginAttempt(turnCtx, func(recheckCtx context.Context) error {
+			billingRecheckErr = h.billingCacheService.RecheckBillingEligibility(
+				recheckCtx,
+				apiKey.User,
+				apiKey,
+				apiKey.Group,
+				subscription,
+				service.QuotaPlatform(recheckCtx, apiKey),
+			)
+			return billingRecheckErr
+		})
+		if err != nil {
+			if billingRecheckErr != nil {
+				return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "billing check failed", billingRecheckErr)
+			}
+			if isGatewayAdmissionConcurrencyError(err) || errors.Is(err, context.Canceled) {
+				return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account is busy, please retry later", err)
+			}
+			return service.NewOpenAIWSClientCloseError(coderws.StatusInternalError, "failed to begin account attempt", err)
+		}
+		activeTurnFinish = finish
+		return nil
 	}
 	ensureUserSlotHeld := func() bool {
 		admissionMu.Lock()
@@ -1813,6 +1899,25 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				return
 			}
 		}
+		if useExtraAdmission {
+			admissionMu.Lock()
+			attemptErr := beginCurrentExtraAttemptLocked(ctx)
+			if attemptErr != nil {
+				releaseTurnSlotsLocked()
+			} else if currentAdmittedTarget.Account != nil {
+				account = currentAdmittedTarget.Account
+				accountMaxConcurrency = account.Concurrency
+				if selection != nil && selection.WaitPlan != nil && selection.WaitPlan.MaxConcurrency > 0 {
+					accountMaxConcurrency = selection.WaitPlan.MaxConcurrency
+				}
+			}
+			admissionMu.Unlock()
+			if attemptErr != nil {
+				closeAdmissionError(attemptErr)
+				return
+			}
+		}
+		ctx = setOpsSelectedAccountContext(c, ctx, account.ID, account.Platform)
 		if err := h.gatewayService.BindStickySession(ctx, apiKey.GroupID, sessionHash, account.ID); err != nil {
 			reqLog.Warn("openai.websocket_bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 		}
@@ -1914,26 +2019,11 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 						}
 					}
 				}
-				if useExtraAdmission {
-					if currentAdmittedTarget == nil {
+				if useExtraAdmission && activeTurnFinish == nil {
+					if err := beginCurrentExtraAttemptLocked(turnCtx); err != nil {
 						releaseTurnSlotsLocked()
-						return service.NewOpenAIWSClientCloseError(coderws.StatusInternalError, "websocket target admission is unavailable", nil)
+						return err
 					}
-					finish, err := currentAdmittedTarget.BeginAttempt(turnCtx, func(recheckCtx context.Context) error {
-						return h.billingCacheService.RecheckBillingEligibility(
-							recheckCtx,
-							apiKey.User,
-							apiKey,
-							apiKey.Group,
-							subscription,
-							service.QuotaPlatform(recheckCtx, apiKey),
-						)
-					})
-					if err != nil {
-						releaseTurnSlotsLocked()
-						return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "billing check failed", err)
-					}
-					activeTurnFinish = finish
 				}
 				activeTurn = true
 				return nil

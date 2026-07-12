@@ -29,11 +29,9 @@ func (s *SettingService) UpdateSettings(ctx context.Context, settings *SystemSet
 		return err
 	}
 
-	err = s.settingRepo.SetMultiple(ctx, updates)
-	if err == nil {
-		s.refreshCachedSettings(settings)
-	}
-	return err
+	s.settingsUpdateMu.Lock()
+	defer s.settingsUpdateMu.Unlock()
+	return s.persistAndRefreshSettings(ctx, updates, settings)
 }
 
 // UpdateSettingsWithAuthSourceDefaults persists system settings and auth-source defaults in a single write.
@@ -51,11 +49,38 @@ func (s *SettingService) UpdateSettingsWithAuthSourceDefaults(ctx context.Contex
 		updates[key] = value
 	}
 
-	err = s.settingRepo.SetMultiple(ctx, updates)
-	if err == nil {
+	s.settingsUpdateMu.Lock()
+	defer s.settingsUpdateMu.Unlock()
+	return s.persistAndRefreshSettings(ctx, updates, settings)
+}
+
+func (s *SettingService) persistAndRefreshSettings(ctx context.Context, updates map[string]string, settings *SystemSettings) error {
+	update := func(updateCtx context.Context) error {
+		if err := s.settingRepo.SetMultiple(updateCtx, updates); err != nil {
+			return err
+		}
 		s.refreshCachedSettings(settings)
+		return nil
 	}
-	return err
+	if s.extraConcurrencyNotifier == nil {
+		return update(ctx)
+	}
+	fencedRepo, ok := s.settingRepo.(FencedSettingRepository)
+	if !ok {
+		return errors.New("serialize settings update: repository does not support fenced writes")
+	}
+	return s.extraConcurrencyNotifier.SerializeExtraConcurrencySettingsUpdate(
+		ctx,
+		settings.ExtraConcurrencyEnabled,
+		fencedRepo.ReserveSettingUpdateFence,
+		func(updateCtx context.Context, fence int64) error {
+			if err := fencedRepo.SetMultipleFenced(updateCtx, updates, fence); err != nil {
+				return err
+			}
+			s.refreshCachedSettings(settings)
+			return nil
+		},
+	)
 }
 
 func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, settings *SystemSettings) (map[string]string, error) {
@@ -642,6 +667,7 @@ func (s *SettingService) refreshCachedSettings(settings *SystemSettings) {
 	// codex_cli_only 加固策略缓存：设置更新后强制下次重载（涉及 4 个键 + JSON 解析，直接置过期）。
 	s.codexRestrictionPolicySF.Forget("codex_restriction_policy")
 	s.codexRestrictionPolicyCache.Store(&cachedCodexRestrictionPolicy{expiresAt: 0})
+	generation := s.extraConcurrencyRuntimeGen.Add(1)
 	s.extraConcurrencyRuntimeSF.Forget(extraConcurrencyRuntimeCacheKey)
 	extraConcurrencyRuntime := cloneExtraConcurrencyRuntimeSettings(ExtraConcurrencyRuntimeSettings{
 		Enabled:            settings.ExtraConcurrencyEnabled,
@@ -650,7 +676,7 @@ func (s *SettingService) refreshCachedSettings(settings *SystemSettings) {
 		MinReservedSlots:   settings.ExtraConcurrencyMinReservedSlots,
 		PlatformReserves:   settings.ExtraConcurrencyPlatformReserves,
 	})
-	s.extraConcurrencyRuntimeCache.Store(&extraConcurrencyRuntime)
+	s.storeExtraConcurrencyRuntimeSettings(extraConcurrencyRuntime, generation)
 	if s.onUpdate != nil {
 		s.onUpdate() // Invalidate cache after settings update
 	}

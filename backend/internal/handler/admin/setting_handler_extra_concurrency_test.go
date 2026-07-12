@@ -3,12 +3,14 @@ package admin
 import (
 	"bytes"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
+	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -159,5 +161,38 @@ func TestDiffSettingsIncludesAllExtraConcurrencySettings(t *testing.T) {
 		service.SettingKeyExtraConcurrencyReservePercent,
 		service.SettingKeyExtraConcurrencyMinReservedSlots,
 		service.SettingKeyExtraConcurrencyPlatformReserves,
+	}, changed)
+}
+
+func TestAuditSettingsUpdateLogsExtraConcurrencyChanges(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var output bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{UserID: 73})
+	c.Set(string(middleware.ContextKeyUserRole), service.RoleAdmin)
+	before := &service.SystemSettings{}
+	after := &service.SystemSettings{
+		DefaultExtraConcurrency: 2,
+		ExtraConcurrencyEnabled: true,
+	}
+
+	(&SettingHandler{}).auditSettingsUpdate(c, before, after, nil, nil, UpdateSettingsRequest{})
+
+	var entry map[string]any
+	require.NoError(t, json.Unmarshal(bytes.TrimSpace(output.Bytes()), &entry))
+	require.Equal(t, "settings updated", entry["msg"])
+	require.Equal(t, true, entry["audit"])
+	require.Equal(t, float64(73), entry["user_id"])
+	require.Equal(t, service.RoleAdmin, entry["role"])
+	changed, ok := entry["changed"].([]any)
+	require.True(t, ok)
+	require.ElementsMatch(t, []any{
+		service.SettingKeyDefaultExtraConcurrency,
+		service.SettingKeyExtraConcurrencyEnabled,
 	}, changed)
 }

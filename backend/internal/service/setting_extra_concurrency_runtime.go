@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
+	"time"
 )
 
 var extraConcurrencyRuntimeSettingKeys = []string{
@@ -14,7 +16,12 @@ var extraConcurrencyRuntimeSettingKeys = []string{
 	SettingKeyExtraConcurrencyPlatformReserves,
 }
 
-const extraConcurrencyRuntimeCacheKey = "extra_concurrency_runtime"
+const (
+	extraConcurrencyRuntimeCacheKey = "extra_concurrency_runtime"
+	extraConcurrencyRuntimeCacheTTL = 10 * time.Second
+)
+
+var errExtraConcurrencyRuntimeInvalidated = errors.New("extra concurrency runtime settings invalidated")
 
 type ExtraConcurrencyRuntimeSettings struct {
 	Enabled            bool
@@ -24,40 +31,94 @@ type ExtraConcurrencyRuntimeSettings struct {
 	PlatformReserves   map[string]ExtraConcurrencyPlatformReserve
 }
 
+type cachedExtraConcurrencyRuntimeSettings struct {
+	settings   ExtraConcurrencyRuntimeSettings
+	expiresAt  int64
+	generation uint64
+}
+
 func (s *SettingService) GetExtraConcurrencyRuntimeSettings(ctx context.Context) ExtraConcurrencyRuntimeSettings {
 	fallback := disabledExtraConcurrencyRuntimeSettings()
 	if s == nil || s.settingRepo == nil {
 		return fallback
 	}
-	if cached := s.loadExtraConcurrencyRuntimeSettings(); cached != nil {
-		return cloneExtraConcurrencyRuntimeSettings(*cached)
-	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	result, _, _ := s.extraConcurrencyRuntimeSF.Do(extraConcurrencyRuntimeCacheKey, func() (any, error) {
+	for {
 		if cached := s.loadExtraConcurrencyRuntimeSettings(); cached != nil {
+			return cloneExtraConcurrencyRuntimeSettings(cached.settings)
+		}
+		result, err, _ := s.extraConcurrencyRuntimeSF.Do(extraConcurrencyRuntimeCacheKey, func() (any, error) {
+			if cached := s.loadExtraConcurrencyRuntimeSettings(); cached != nil {
+				return cached, nil
+			}
+			generation := s.extraConcurrencyRuntimeGen.Load()
+			values, err := s.settingRepo.GetMultiple(ctx, extraConcurrencyRuntimeSettingKeys)
+			snapshot := fallback
+			if err == nil {
+				snapshot = parseExtraConcurrencyRuntimeSettings(values)
+			}
+			if s.extraConcurrencyRuntimeGen.Load() != generation {
+				return nil, errExtraConcurrencyRuntimeInvalidated
+			}
+			cached := s.storeExtraConcurrencyRuntimeSettings(snapshot, generation)
+			if s.extraConcurrencyRuntimeGen.Load() != generation {
+				return nil, errExtraConcurrencyRuntimeInvalidated
+			}
 			return cached, nil
+		})
+		if errors.Is(err, errExtraConcurrencyRuntimeInvalidated) {
+			continue
 		}
-		values, err := s.settingRepo.GetMultiple(ctx, extraConcurrencyRuntimeSettingKeys)
-		snapshot := fallback
-		if err == nil {
-			snapshot = parseExtraConcurrencyRuntimeSettings(values)
+		cached, ok := result.(*cachedExtraConcurrencyRuntimeSettings)
+		if !ok || cached == nil {
+			return fallback
 		}
-		cached := cloneExtraConcurrencyRuntimeSettings(snapshot)
-		s.extraConcurrencyRuntimeCache.Store(&cached)
-		return &cached, nil
-	})
-	cached, ok := result.(*ExtraConcurrencyRuntimeSettings)
-	if !ok || cached == nil {
-		return fallback
+		return cloneExtraConcurrencyRuntimeSettings(cached.settings)
 	}
-	return cloneExtraConcurrencyRuntimeSettings(*cached)
 }
 
-func (s *SettingService) loadExtraConcurrencyRuntimeSettings() *ExtraConcurrencyRuntimeSettings {
-	cached, _ := s.extraConcurrencyRuntimeCache.Load().(*ExtraConcurrencyRuntimeSettings)
+func (s *SettingService) loadExtraConcurrencyRuntimeSettings() *cachedExtraConcurrencyRuntimeSettings {
+	cached, _ := s.extraConcurrencyRuntimeCache.Load().(*cachedExtraConcurrencyRuntimeSettings)
+	if cached == nil || cached.generation != s.extraConcurrencyRuntimeGen.Load() || cached.expiresAt <= s.extraConcurrencyRuntimeTime().UnixNano() {
+		return nil
+	}
 	return cached
+}
+
+func (s *SettingService) storeExtraConcurrencyRuntimeSettings(settings ExtraConcurrencyRuntimeSettings, generation uint64) *cachedExtraConcurrencyRuntimeSettings {
+	cached := &cachedExtraConcurrencyRuntimeSettings{
+		settings:   cloneExtraConcurrencyRuntimeSettings(settings),
+		expiresAt:  s.extraConcurrencyRuntimeTime().Add(extraConcurrencyRuntimeCacheTTL).UnixNano(),
+		generation: generation,
+	}
+	s.extraConcurrencyRuntimeCache.Store(cached)
+	return cached
+}
+
+func (s *SettingService) InvalidateExtraConcurrencyRuntimeSettings() {
+	if s == nil {
+		return
+	}
+	generation := s.extraConcurrencyRuntimeGen.Add(1)
+	s.extraConcurrencyRuntimeSF.Forget(extraConcurrencyRuntimeCacheKey)
+	settings := disabledExtraConcurrencyRuntimeSettings()
+	if cached, _ := s.extraConcurrencyRuntimeCache.Load().(*cachedExtraConcurrencyRuntimeSettings); cached != nil {
+		settings = cached.settings
+	}
+	s.extraConcurrencyRuntimeCache.Store(&cachedExtraConcurrencyRuntimeSettings{
+		settings:   cloneExtraConcurrencyRuntimeSettings(settings),
+		expiresAt:  0,
+		generation: generation,
+	})
+}
+
+func (s *SettingService) extraConcurrencyRuntimeTime() time.Time {
+	if s != nil && s.extraConcurrencyRuntimeNow != nil {
+		return s.extraConcurrencyRuntimeNow()
+	}
+	return time.Now()
 }
 
 func parseExtraConcurrencyRuntimeSettings(values map[string]string) ExtraConcurrencyRuntimeSettings {

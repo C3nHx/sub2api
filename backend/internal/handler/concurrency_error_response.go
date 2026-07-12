@@ -11,6 +11,13 @@ import (
 
 const statusClientClosedRequest = 499
 
+func isGatewayAdmissionConcurrencyError(err error) bool {
+	var extraUnavailable *service.ExtraConcurrencyUnavailableError
+	var timeout *service.GatewayAdmissionTimeoutError
+	var queueFull *service.GatewayAdmissionQueueFullError
+	return errors.As(err, &extraUnavailable) || errors.As(err, &timeout) || errors.As(err, &queueFull)
+}
+
 func concurrencyErrorResponse(err error, slotType string) (int, string, string) {
 	var extraUnavailableErr *service.ExtraConcurrencyUnavailableError
 	if errors.As(err, &extraUnavailableErr) {

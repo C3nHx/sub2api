@@ -5,7 +5,9 @@ package service
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
@@ -18,6 +20,116 @@ type extraConcurrencySettingRepoStub struct {
 	getMultiErr  error
 	setMultiErr  error
 	getMultiCall int
+	updateFence  int64
+}
+
+type blockingExtraConcurrencySettingRepo struct {
+	*extraConcurrencySettingRepoStub
+	mu      sync.Mutex
+	calls   int
+	started chan struct{}
+	release chan struct{}
+}
+
+type reorderingExtraConcurrencySettingRepo struct {
+	*extraConcurrencySettingRepoStub
+	mu              sync.Mutex
+	calls           int
+	firstPersisted  chan struct{}
+	secondPersisted chan struct{}
+	releaseFirst    chan struct{}
+	persisted       bool
+}
+
+func (r *reorderingExtraConcurrencySettingRepo) SetMultiple(_ context.Context, settings map[string]string) error {
+	r.mu.Lock()
+	r.calls++
+	call := r.calls
+	r.persisted = settings[SettingKeyExtraConcurrencyEnabled] == "true"
+	if call == 1 {
+		close(r.firstPersisted)
+	}
+	if call == 2 {
+		close(r.secondPersisted)
+	}
+	r.mu.Unlock()
+
+	if call == 1 {
+		<-r.releaseFirst
+	}
+	return nil
+}
+
+func (r *reorderingExtraConcurrencySettingRepo) SetMultipleFenced(ctx context.Context, settings map[string]string, fence int64) error {
+	if fence != r.updateFence {
+		return ErrStaleSettingUpdateFence
+	}
+	return r.SetMultiple(ctx, settings)
+}
+
+func (r *reorderingExtraConcurrencySettingRepo) persistedEnabled() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.persisted
+}
+
+type recordingExtraConcurrencySettingsNotifier struct {
+	mu        sync.Mutex
+	states    []bool
+	published chan bool
+}
+
+func (n *recordingExtraConcurrencySettingsNotifier) PublishExtraConcurrencySettingsState(_ context.Context, enabled bool) error {
+	n.mu.Lock()
+	n.states = append(n.states, enabled)
+	n.mu.Unlock()
+	n.published <- enabled
+	return nil
+}
+
+func (n *recordingExtraConcurrencySettingsNotifier) SerializeExtraConcurrencySettingsUpdate(
+	ctx context.Context,
+	enabled bool,
+	reserveFence func(context.Context) (int64, error),
+	update func(context.Context, int64) error,
+) error {
+	fence, err := reserveFence(ctx)
+	if err != nil {
+		return err
+	}
+	if err := update(ctx, fence); err != nil {
+		return err
+	}
+	return n.PublishExtraConcurrencySettingsState(ctx, enabled)
+}
+
+func (n *recordingExtraConcurrencySettingsNotifier) SubscribeExtraConcurrencySettingsInvalidation(context.Context, func()) error {
+	return nil
+}
+
+func (n *recordingExtraConcurrencySettingsNotifier) completed() []bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]bool(nil), n.states...)
+}
+
+func (s *blockingExtraConcurrencySettingRepo) GetMultiple(_ context.Context, keys []string) (map[string]string, error) {
+	s.mu.Lock()
+	s.calls++
+	first := s.calls == 1
+	out := make(map[string]string, len(keys))
+	for _, key := range keys {
+		if value, ok := s.values[key]; ok {
+			out[key] = value
+		}
+	}
+	s.mu.Unlock()
+
+	if first {
+		close(s.started)
+		<-s.release
+	}
+	return out, nil
 }
 
 func (s *extraConcurrencySettingRepoStub) Get(context.Context, string) (*Setting, error) {
@@ -60,6 +172,18 @@ func (s *extraConcurrencySettingRepoStub) SetMultiple(_ context.Context, setting
 		s.values[key] = value
 	}
 	return nil
+}
+
+func (s *extraConcurrencySettingRepoStub) ReserveSettingUpdateFence(context.Context) (int64, error) {
+	s.updateFence++
+	return s.updateFence, nil
+}
+
+func (s *extraConcurrencySettingRepoStub) SetMultipleFenced(ctx context.Context, settings map[string]string, fence int64) error {
+	if fence != s.updateFence {
+		return ErrStaleSettingUpdateFence
+	}
+	return s.SetMultiple(ctx, settings)
 }
 
 func (s *extraConcurrencySettingRepoStub) GetAll(context.Context) (map[string]string, error) {
@@ -323,6 +447,124 @@ func TestSettingServiceGetExtraConcurrencyRuntimeSettingsUsesProcessCache(t *tes
 	require.True(t, first.Enabled)
 	require.True(t, second.Enabled)
 	require.Equal(t, 1, repo.getMultiCall)
+}
+
+func TestSettingServiceConcurrentUpdatesPublishPersistedDrainStateLast(t *testing.T) {
+	repo := &reorderingExtraConcurrencySettingRepo{
+		extraConcurrencySettingRepoStub: &extraConcurrencySettingRepoStub{},
+		firstPersisted:                  make(chan struct{}),
+		secondPersisted:                 make(chan struct{}),
+		releaseFirst:                    make(chan struct{}),
+	}
+	notifier := &recordingExtraConcurrencySettingsNotifier{published: make(chan bool, 2)}
+	svc := NewSettingService(repo, &config.Config{})
+	svc.SetExtraConcurrencySettingsNotifier(notifier)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- svc.UpdateSettings(context.Background(), concurrentExtraConcurrencySettings(false))
+	}()
+	<-repo.firstPersisted
+
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- svc.UpdateSettings(context.Background(), concurrentExtraConcurrencySettings(true))
+	}()
+
+	select {
+	case <-repo.secondPersisted:
+		select {
+		case state := <-notifier.published:
+			require.True(t, state, "the newer persisted setting should publish first in the forced race")
+		case <-time.After(time.Second):
+			t.Fatal("newer settings update did not publish before the delayed older refresh")
+		}
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(repo.releaseFirst)
+
+	select {
+	case err := <-firstDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("first settings refresh did not finish")
+	}
+	select {
+	case err := <-secondDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("second settings refresh did not finish")
+	}
+	require.True(t, repo.persistedEnabled())
+	require.Equal(t, []bool{false, true}, notifier.completed(),
+		"drain publishes must follow the same order as the serialized settings writes")
+}
+
+func concurrentExtraConcurrencySettings(enabled bool) *SystemSettings {
+	return &SystemSettings{
+		ExtraConcurrencyEnabled:            enabled,
+		ExtraConcurrencyWaitTimeoutSeconds: 30,
+		ExtraConcurrencyReservePercent:     10,
+		ExtraConcurrencyMinReservedSlots:   1,
+		ExtraConcurrencyPlatformReserves:   map[string]ExtraConcurrencyPlatformReserve{},
+	}
+}
+
+func TestSettingServiceGetExtraConcurrencyRuntimeSettingsRefreshesAfterTTL(t *testing.T) {
+	repo := &extraConcurrencySettingRepoStub{values: map[string]string{
+		SettingKeyExtraConcurrencyEnabled:            "true",
+		SettingKeyExtraConcurrencyWaitTimeoutSeconds: "45",
+		SettingKeyExtraConcurrencyReservePercent:     "25.5",
+		SettingKeyExtraConcurrencyMinReservedSlots:   "3",
+		SettingKeyExtraConcurrencyPlatformReserves:   `{}`,
+	}}
+	now := time.Unix(1_700_000_000, 0)
+	svc := NewSettingService(repo, &config.Config{})
+	svc.extraConcurrencyRuntimeNow = func() time.Time { return now }
+
+	first := svc.GetExtraConcurrencyRuntimeSettings(context.Background())
+	repo.values[SettingKeyExtraConcurrencyEnabled] = "false"
+	now = now.Add(9 * time.Second)
+	withinTTL := svc.GetExtraConcurrencyRuntimeSettings(context.Background())
+	now = now.Add(2 * time.Second)
+	afterTTL := svc.GetExtraConcurrencyRuntimeSettings(context.Background())
+
+	require.True(t, first.Enabled)
+	require.True(t, withinTTL.Enabled)
+	require.False(t, afterTTL.Enabled)
+	require.Equal(t, 2, repo.getMultiCall)
+}
+
+func TestSettingServiceExtraConcurrencyInvalidationRejectsStaleInflightLoad(t *testing.T) {
+	repo := &blockingExtraConcurrencySettingRepo{
+		extraConcurrencySettingRepoStub: &extraConcurrencySettingRepoStub{values: map[string]string{
+			SettingKeyExtraConcurrencyEnabled:            "true",
+			SettingKeyExtraConcurrencyWaitTimeoutSeconds: "45",
+			SettingKeyExtraConcurrencyReservePercent:     "25.5",
+			SettingKeyExtraConcurrencyMinReservedSlots:   "3",
+			SettingKeyExtraConcurrencyPlatformReserves:   `{}`,
+		}},
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	svc := NewSettingService(repo, &config.Config{})
+	firstResult := make(chan ExtraConcurrencyRuntimeSettings, 1)
+	go func() {
+		firstResult <- svc.GetExtraConcurrencyRuntimeSettings(context.Background())
+	}()
+	<-repo.started
+
+	repo.values[SettingKeyExtraConcurrencyEnabled] = "false"
+	svc.InvalidateExtraConcurrencyRuntimeSettings()
+	second := svc.GetExtraConcurrencyRuntimeSettings(context.Background())
+	close(repo.release)
+	first := <-firstResult
+	third := svc.GetExtraConcurrencyRuntimeSettings(context.Background())
+
+	require.False(t, first.Enabled)
+	require.False(t, second.Enabled)
+	require.False(t, third.Enabled)
+	require.Equal(t, 2, repo.calls)
 }
 
 func TestSettingServiceGetExtraConcurrencyRuntimeSettingsDisablesWhenKeyIsMissing(t *testing.T) {
