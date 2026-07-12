@@ -357,6 +357,10 @@ function Assert-RunnerCleanupSuccess {
     if (-not [bool]$status.resource_cleanup.passed) {
         throw "$Name recorded a failed cleanup: $(@($status.resource_cleanup.failures) -join '; ')"
     }
+    $summaryText = Get-Content -Raw -LiteralPath (Join-Path $outputDirectory "summary.md")
+    if (-not $summaryText.Contains("- Docker cleanup failures: none")) {
+        throw "$Name did not report an empty cleanup failure list as none.`n$summaryText"
+    }
     $calls = Get-Content -Raw -LiteralPath (Join-Path $stateDirectory "calls.log")
     $runID = "$($status.resource_cleanup.run_id)"
     if (-not $calls.Contains("SUB2API_TEST_RUN_ID=$runID")) {

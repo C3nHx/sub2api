@@ -515,11 +515,11 @@ $resourceCleanupFailures = @(
     if ($null -eq $resourceCleanup) {
         "resource cleanup evidence is missing"
     } else {
-        $value = Get-OptionalValue -Object $resourceCleanup -Name "failures"
-        if ($null -eq $value) {
+        $property = $resourceCleanup.PSObject.Properties["failures"]
+        if ($null -eq $property) {
             "resource cleanup failure details are missing"
         } else {
-            @($value)
+            @($property.Value)
         }
     }
 )
