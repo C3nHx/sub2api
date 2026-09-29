@@ -613,10 +613,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			payload, err = parseClientPayload(nextTurn, nextClientMessage)
 			return payload, false, err
 		}
+		// upstreamTurn 只计实际发往上游的轮次：本地应答的预热不算，
+		// 预热后的首个真实请求仍按首轮处理（首轮换号、首输出前暂存）。
+		upstreamTurn := 0
 		for turn := 1; ; turn++ {
 			if isOpenAIWSHTTPBridgePrewarmPayload(currentBridgePayload.payloadRaw) {
-				// 预热不发上游、不走 turn hooks（不占并发槽、不记用量），只在本地应答，
-				// 并把预热携带的 input 记入 replay 历史，供下一轮 previous_response_id 续接。
+				// 预热不发上游、不记用量，只在本地应答，并把预热携带的 input 记入
+				// replay 历史，供下一轮 previous_response_id 续接。
 				prewarmItems, prewarmItemsExist, extractErr := openAIWSExtractNormalizedInputSequence(
 					currentBridgePayload.payloadRaw,
 				)
@@ -649,6 +652,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					len(prewarmItems),
 					hasPrevious,
 				)
+				// 握手时占的并发槽要在这里释放（result 为 nil 时 AfterTurn 只放槽、不记用量），
+				// 否则预热后迟迟不发请求的空闲连接会一直占着账号槽。
+				if hooks != nil && hooks.AfterTurn != nil {
+					hooks.AfterTurn(turn, nil, nil)
+				}
 				nextPayload, closed, nextErr := readNextBridgePayload(turn + 1)
 				if nextErr != nil || closed {
 					return nextErr
@@ -748,6 +756,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					return fmt.Errorf("resolve Grok websocket cache identity: %w", err)
 				}
 			}
+			upstreamTurn++
 			result, bridgeErr := s.proxyOpenAIWSHTTPBridgeTurn(
 				ctx,
 				c,
@@ -760,7 +769,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				currentBridgePayload.imageSizeTier,
 				currentBridgePayload.imageInputSize,
 				grokCacheIdentity,
-				turn,
+				upstreamTurn,
 				writeClientMessage,
 			)
 			if bridgeErr != nil && isOpenAIWSSessionPreempted(ctx) {
@@ -775,6 +784,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 			if bridgeErr != nil {
 				var failoverErr *UpstreamFailoverError
+				// 首帧是本地应答的预热时，预热后的首个真实请求（upstreamTurn==1）
+				// 也走这里：只能按当前轮重放，不能重放预热首帧。
 				if turn > 1 && errors.As(bridgeErr, &failoverErr) && failoverErr != nil {
 					retryPayload, retrySafe, retryPayloadErr := buildOpenAIWSCurrentTurnRetryPayload(
 						currentBridgePayload.accountIdentitySourceRaw,
