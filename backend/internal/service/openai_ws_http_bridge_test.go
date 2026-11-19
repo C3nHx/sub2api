@@ -396,7 +396,9 @@ func TestOpenAIWSHTTPBridgeAPIKeyReusesClientToolMappingWhenFollowupOmitsTools(t
 	gin.SetMode(gin.TestMode)
 
 	firstSSEBody := strings.Join([]string{
-		`data: {"type":"response.completed","response":{"id":"resp_custom_first","model":"gpt-5.6-sol","output":[{"type":"function_call","id":"fc_custom_1","call_id":"call_custom_1","name":"exec","arguments":"{\"input\":\"pwd\"}"}],"usage":{"input_tokens":9,"output_tokens":1}}}`,
+		`data: {"type":"response.output_item.done","item":{"type":"message","id":"msg_bridge","role":"assistant","content":[{"type":"output_text","text":"I will check."}]}}`,
+		"",
+		`data: {"type":"response.completed","response":{"id":"resp_custom_first","model":"gpt-5.6-sol","output":[{"type":"reasoning","id":"rs_bridge"},{"type":"message","id":"msg_bridge","role":"assistant","content":[{"type":"output_text","text":"I will check."}]},{"type":"function_call","id":"fc_custom_1","call_id":"call_custom_1","name":"exec","arguments":"{\"input\":\"pwd\"}"}],"usage":{"input_tokens":9,"output_tokens":1}}}`,
 		"",
 	}, "\n")
 	secondSSEBody := strings.Join([]string{
@@ -474,10 +476,11 @@ func TestOpenAIWSHTTPBridgeAPIKeyReusesClientToolMappingWhenFollowupOmitsTools(t
 	}
 
 	writeMessage(`{"type":"response.create","model":"gpt-5.6-sol","stream":true,"tools":[{"type":"custom","name":"exec"}],"input":"run pwd"}`)
+	require.Equal(t, "msg_bridge", gjson.GetBytes(readMessage(), "item.id").String())
 	firstEvent := readMessage()
 	require.Equal(t, "response.completed", gjson.GetBytes(firstEvent, "type").String())
-	require.Equal(t, "custom_tool_call", gjson.GetBytes(firstEvent, "response.output.0.type").String())
-	require.Equal(t, "pwd", gjson.GetBytes(firstEvent, "response.output.0.input").String())
+	require.Equal(t, "custom_tool_call", gjson.GetBytes(firstEvent, "response.output.2.type").String())
+	require.Equal(t, "pwd", gjson.GetBytes(firstEvent, "response.output.2.input").String())
 
 	writeMessage(`{"type":"response.create","model":"gpt-5.6-sol","stream":true,"previous_response_id":"resp_custom_first","input":[{"type":"custom_tool_call_output","id":"ctco_client_output_1","call_id":"call_custom_1","output":"ok"}]}`)
 	secondEvent := readMessage()
@@ -500,14 +503,16 @@ func TestOpenAIWSHTTPBridgeAPIKeyReusesClientToolMappingWhenFollowupOmitsTools(t
 	require.Equal(t, "function", secondTools[0].Get("type").String())
 	require.Equal(t, "exec", secondTools[0].Get("name").String())
 	secondInput := gjson.GetBytes(upstream.bodies[1], "input").Array()
-	require.Len(t, secondInput, 3)
+	require.Len(t, secondInput, 5)
 	require.Equal(t, "run pwd", secondInput[0].String())
-	require.Equal(t, "function_call", secondInput[1].Get("type").String())
-	require.Equal(t, "fc_custom_1", secondInput[1].Get("id").String())
-	require.JSONEq(t, `{"input":"pwd"}`, secondInput[1].Get("arguments").String())
-	require.False(t, secondInput[1].Get("input").Exists())
-	require.Equal(t, "function_call_output", secondInput[2].Get("type").String())
-	require.False(t, secondInput[2].Get("id").Exists())
+	require.Equal(t, "rs_bridge", secondInput[1].Get("id").String())
+	require.Equal(t, "msg_bridge", secondInput[2].Get("id").String())
+	require.Equal(t, "function_call", secondInput[3].Get("type").String())
+	require.Equal(t, "fc_custom_1", secondInput[3].Get("id").String())
+	require.JSONEq(t, `{"input":"pwd"}`, secondInput[3].Get("arguments").String())
+	require.False(t, secondInput[3].Get("input").Exists())
+	require.Equal(t, "function_call_output", secondInput[4].Get("type").String())
+	require.False(t, secondInput[4].Get("id").Exists())
 }
 
 func TestOpenAIWSHTTPBridgeFullCustomToolHistoryWithoutPreviousResponseIDDoesNotReplay(t *testing.T) {
@@ -781,7 +786,15 @@ func startOpenAIWSHTTPBridgePrewarmTestSession(
 		Credentials: map[string]any{"access_token": "test-token"}, Extra: map[string]any{"responses_websockets_v2_enabled": true},
 		Concurrency: 1, Status: StatusActive, Schedulable: true,
 	}
+	_, write, read, errCh = startOpenAIWSIngressSession(t, svc, account, nil, hooks)
+	return
+}
 
+func startOpenAIWSIngressSession(t *testing.T, svc *OpenAIGatewayService, account *Account, headers http.Header, hooks *OpenAIWSIngressHooks) (
+	client *coderws.Conn, write func(string), read func() []byte, errCh <-chan error,
+) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
 	proxyErrCh := make(chan error, 1)
 	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := coderws.Accept(w, r, nil)
@@ -790,6 +803,7 @@ func startOpenAIWSHTTPBridgePrewarmTestSession(
 			return
 		}
 		defer func() { _ = conn.CloseNow() }()
+		conn.SetReadLimit(ResolveOpenAIWSClientReadLimitBytes(svc.cfg))
 		readCtx, cancelRead := context.WithTimeout(r.Context(), 3*time.Second)
 		_, firstMessage, err := conn.Read(readCtx)
 		cancelRead()
@@ -805,7 +819,7 @@ func startOpenAIWSHTTPBridgePrewarmTestSession(
 	t.Cleanup(wsServer.Close)
 
 	dialCtx, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
-	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(wsServer.URL, "http"), nil)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(wsServer.URL, "http"), &coderws.DialOptions{HTTPHeader: headers})
 	cancelDial()
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = clientConn.CloseNow() })
@@ -822,7 +836,7 @@ func startOpenAIWSHTTPBridgePrewarmTestSession(
 		require.NoError(t, readErr)
 		return event
 	}
-	return write, read, proxyErrCh
+	return clientConn, write, read, proxyErrCh
 }
 
 func waitOpenAIWSHTTPBridgeProxyErr(t *testing.T, errCh <-chan error) error {

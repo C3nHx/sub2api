@@ -243,6 +243,200 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_KeepLeaseAcrossT
 	require.Len(t, captureConn.writes, 2, "应向同一上游连接发送两轮 response.create")
 }
 
+func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_PluginTransport(t *testing.T) {
+	const prewarm = `{"type":"response.create","model":"gpt-5.1","generate":false}`
+	for _, tc := range []struct {
+		name, mode, transport                                              string
+		legacy, forceHTTP, accountForceHTTP, large, unbound, oauthDisabled bool
+		unschedulable                                                      bool
+	}{
+		{name: "native", mode: "ctx_pool", transport: "ws"},
+		{name: "shared", mode: "shared", transport: "ws"},
+		{name: "dedicated", mode: "dedicated", transport: "ws"},
+		{name: "large", mode: "ctx_pool", transport: "bridge", large: true},
+		{name: "explicit bridge", mode: "http_bridge", transport: "bridge"},
+		{name: "explicit off", mode: "off", transport: "off", unschedulable: true},
+		{name: "global force HTTP", mode: "ctx_pool", transport: "bridge", forceHTTP: true},
+		{name: "account force HTTP", mode: "ctx_pool", transport: "bridge", accountForceHTTP: true},
+		{name: "OAuth WS disabled", mode: "ctx_pool", transport: "bridge", oauthDisabled: true},
+		{name: "legacy plugin binding", mode: "ctx_pool", transport: "bridge", legacy: true},
+		{name: "plugin passthrough", mode: "passthrough", transport: "bridge"},
+		{name: "unbound", mode: "ctx_pool", transport: "ws", unbound: true},
+		{name: "unbound force HTTP", mode: "ctx_pool", forceHTTP: true, unbound: true, unschedulable: true},
+		{name: "unbound passthrough without WSS", mode: "passthrough", oauthDisabled: true, unbound: true, unschedulable: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.Gateway.OpenAIWS.Enabled = true
+			cfg.Gateway.OpenAIWS.OAuthEnabled = !tc.oauthDisabled
+			cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = !tc.legacy
+			cfg.Gateway.OpenAIWS.ForceHTTP = tc.forceHTTP
+			cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+			cfg.Gateway.OpenAIWS.HTTPBridgeEnabled = true
+			cfg.Gateway.OpenAIWS.HTTPBridgeThresholdBytes = 15 * 1024 * 1024
+			cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
+			cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 1
+			cfg.Gateway.OpenAIWS.QueueLimitPerConn = 8
+
+			upstream := &openAIWSCaptureConn{events: [][]byte{
+				[]byte(`{"type":"response.completed","response":{"id":"resp_prewarm","output":[]}}`),
+				[]byte(`{"type":"response.completed","response":{"id":"resp_first","output":[{"type":"message","id":"msg_first","role":"assistant"}]}}`),
+				[]byte(`{"type":"response.completed","response":{"id":"resp_second","output":[{"type":"message","id":"msg_second","role":"assistant"}]}}`),
+			}}
+			dialer := &openAIWSCaptureDialer{conn: upstream}
+			pool := newOpenAIWSConnPool(cfg)
+			t.Cleanup(pool.Close)
+			pool.setClientDialerForTest(dialer)
+
+			plugin := &PluginManager{}
+			if !tc.unbound {
+				plugin.route.Store(&pluginRoute{pluginID: 1, rolloutPercent: 100, unavailable: "test plugin binding"})
+			}
+			svc := &OpenAIGatewayService{cfg: cfg, pluginManager: plugin, openaiWSPool: pool, cache: &stubGatewayCache{}}
+			account := &Account{
+				ID: 91, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1,
+				Extra: map[string]any{
+					"openai_oauth_responses_websockets_v2_mode":    tc.mode,
+					"openai_oauth_responses_websockets_v2_enabled": true,
+					"openai_ws_force_http":                         tc.accountForceHTTP,
+				},
+			}
+			require.Equal(t, !tc.unschedulable, svc.isOpenAIAccountTransportCompatible(account, OpenAIUpstreamTransportResponsesWebsocketV2Ingress))
+			if tc.transport == "" {
+				return
+			}
+
+			client, write, read, proxyErr := startOpenAIWSIngressSession(t, svc, account, nil, nil)
+			firstFrame := prewarm
+			if tc.large {
+				client.SetReadLimit(32 * 1024 * 1024)
+				firstFrame = strings.TrimSuffix(prewarm, "}") + `,"input":"` + strings.Repeat("a", 15*1024*1024) + `"}`
+			}
+			write(firstFrame)
+			switch tc.transport {
+			case "off":
+				var closeErr *OpenAIWSClientCloseError
+				require.ErrorAs(t, waitOpenAIWSHTTPBridgeProxyErr(t, proxyErr), &closeErr)
+				require.Equal(t, coderws.StatusPolicyViolation, closeErr.StatusCode())
+			case "bridge":
+				require.Equal(t, "response.created", gjson.GetBytes(read(), "type").String())
+				completed := read()
+				require.Equal(t, "response.completed", gjson.GetBytes(completed, "type").String())
+				require.Empty(t, gjson.GetBytes(completed, "response.output").Array())
+				require.NoError(t, client.Close(coderws.StatusNormalClosure, "done"))
+				require.NoError(t, waitOpenAIWSHTTPBridgeProxyErr(t, proxyErr))
+			case "ws":
+				completed := read()
+				require.Equal(t, "resp_prewarm", gjson.GetBytes(completed, "response.id").String())
+				require.Empty(t, gjson.GetBytes(completed, "response.output").Array())
+				write(`{"type":"response.create","model":"gpt-5.1","previous_response_id":"resp_prewarm","input":"first"}`)
+				require.Equal(t, "msg_first", gjson.GetBytes(read(), "response.output.0.id").String())
+				write(`{"type":"response.create","model":"gpt-5.1","previous_response_id":"resp_first","input":"second"}`)
+				require.Equal(t, "msg_second", gjson.GetBytes(read(), "response.output.0.id").String())
+				require.NoError(t, client.Close(coderws.StatusNormalClosure, "done"))
+				require.NoError(t, waitOpenAIWSHTTPBridgeProxyErr(t, proxyErr))
+				require.Equal(t, 1, dialer.DialCount())
+				require.Len(t, upstream.writes, 3)
+				require.Equal(t, false, upstream.writes[0]["generate"])
+				require.Equal(t, "resp_prewarm", upstream.writes[1]["previous_response_id"])
+				require.Equal(t, "resp_first", upstream.writes[2]["previous_response_id"])
+				require.Equal(t, "second", upstream.writes[2]["input"])
+				return
+			}
+			require.Zero(t, dialer.DialCount())
+		})
+	}
+}
+
+func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_FingerprintAndWindow(t *testing.T) {
+	for _, mode := range []codexFingerprintMode{codexFingerprintOff, codexFingerprintDevice, codexFingerprintSession, codexFingerprintFull} {
+		t.Run(string(mode), func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.Gateway.OpenAIWS.Enabled = true
+			cfg.Gateway.OpenAIWS.OAuthEnabled = true
+			cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+			cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+			cfg.Gateway.OpenAIWS.StoreDisabledConnMode = "strict"
+			cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 2
+			cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 2
+			cfg.Gateway.OpenAIWS.QueueLimitPerConn = 8
+			cfg.Gateway.OpenAIWS.IngressPreviousResponseRecoveryEnabled = true
+			if mode == codexFingerprintSession {
+				cfg.Gateway.OpenAIWS.MinIdlePerAccount = 2
+			}
+			first := &openAIWSCaptureConn{events: [][]byte{
+				[]byte(`{"type":"response.completed","response":{"id":"resp_fp_first","output":[]}}`),
+				[]byte(`{"type":"error","error":{"type":"invalid_request_error","code":"previous_response_not_found"}}`),
+			}}
+			second := &openAIWSCaptureConn{events: [][]byte{
+				[]byte(`{"type":"response.completed","response":{"id":"resp_fp_second","output":[]}}`),
+				[]byte(`{"type":"response.completed","response":{"id":"resp_fp_third","output":[]}}`),
+			}}
+			other := &openAIWSCaptureConn{events: [][]byte{
+				[]byte(`{"type":"response.completed","response":{"id":"resp_fp_other","output":[]}}`),
+			}}
+			dialer := &openAIWSQueueDialer{conns: []openAIWSClientConn{first, second, other}}
+			pool := newOpenAIWSConnPool(cfg)
+			t.Cleanup(pool.Close)
+			pool.setClientDialerForTest(dialer)
+			svc := &OpenAIGatewayService{cfg: cfg, openaiWSPool: pool, cache: &stubGatewayCache{}}
+			account := &Account{ID: 92, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 2,
+				Extra: map[string]any{codexFingerprintModeExtraKey: string(mode), codexFingerprintSeedExtraKey: "93bb249b-02ab-47c5-b9f0-111890620f80"}}
+
+			headers := make(http.Header)
+			headers.Set("session-id", "client-session")
+			headers.Set("x-codex-installation-id", "client-installation")
+			headers.Set(openAIWSTurnMetadataHeader, `{"window_id":"client-window-1","turn_id":"client-turn-1","sandbox":"first"}`)
+			client, write, read, proxyErr := startOpenAIWSIngressSession(t, svc, account, headers, nil)
+			write(`{"type":"response.create","model":"gpt-5.1","store":false,"prompt_cache_key":"cache","input":"one"}`)
+			require.Equal(t, "resp_fp_first", gjson.GetBytes(read(), "response.id").String())
+			write(`{"type":"response.create","model":"gpt-5.1","store":false,"prompt_cache_key":"cache","previous_response_id":"resp_fp_first","input":"two","client_metadata":{"x-codex-turn-metadata":"{\"window_id\":\"client-window-1\",\"turn_id\":\"client-turn-2\",\"sandbox\":\"second\"}"}}`)
+			require.Equal(t, "resp_fp_second", gjson.GetBytes(read(), "response.id").String())
+			write(`{"type":"response.create","model":"gpt-5.1","store":false,"prompt_cache_key":"cache","previous_response_id":"resp_fp_second","input":"three","client_metadata":{"x-codex-turn-metadata":"{\"window_id\":\"client-window-2\",\"turn_id\":\"client-turn-3\"}"}}`)
+			require.Equal(t, "resp_fp_third", gjson.GetBytes(read(), "response.id").String())
+			require.NoError(t, client.Close(coderws.StatusNormalClosure, "done"))
+			require.NoError(t, waitOpenAIWSHTTPBridgeProxyErr(t, proxyErr))
+
+			require.Equal(t, 2, dialer.DialCount())
+			require.Len(t, first.writes, 2)
+			require.Len(t, second.writes, 2)
+			const metadataPath = "client_metadata." + openAIWSTurnMetadataHeader
+			firstMetadata := gjson.Get(requestToJSONString(first.writes[0]), metadataPath).String()
+			secondMetadata := gjson.Get(requestToJSONString(second.writes[0]), metadataPath).String()
+			require.JSONEq(t, firstMetadata, dialer.headers[0].Get(openAIWSTurnMetadataHeader))
+			require.JSONEq(t, secondMetadata, dialer.headers[1].Get(openAIWSTurnMetadataHeader))
+			require.JSONEq(t, secondMetadata, gjson.Get(requestToJSONString(first.writes[1]), metadataPath).String())
+			require.NotEqual(t, gjson.Get(firstMetadata, "turn_id").String(), gjson.Get(secondMetadata, "turn_id").String())
+			require.Equal(t, "second", gjson.Get(secondMetadata, "sandbox").String())
+			thirdFrame := requestToJSONString(second.writes[1])
+			require.False(t, gjson.Get(thirdFrame, "previous_response_id").Exists())
+			require.Equal(t, "three", gjson.Get(thirdFrame, "input").String())
+			if mode == codexFingerprintSession || mode == codexFingerprintFull {
+				require.NotEqual(t, "client-turn-1", gjson.Get(firstMetadata, "turn_id").String())
+				require.Positive(t, gjson.Get(firstMetadata, "turn_started_at_unix_ms").Int())
+				require.Equal(t, gjson.Get(firstMetadata, "window_id").String(), gjson.Get(gjson.Get(thirdFrame, metadataPath).String(), "window_id").String())
+			} else {
+				require.Equal(t, scopeCodexAccountIdentityValue(account, 0, "turn", "client-turn-1"), gjson.Get(firstMetadata, "turn_id").String())
+				require.Equal(t, scopeCodexAccountIdentityValue(account, 0, "turn", "client-turn-2"), gjson.Get(secondMetadata, "turn_id").String())
+			}
+			wantInstallation := scopeCodexAccountIdentityValue(account, 0, "installation", "client-installation")
+			if mode != codexFingerprintOff {
+				wantInstallation = resolveConvergedInstallationID(account, account.Extra[codexFingerprintSeedExtraKey].(string))
+			}
+			require.Equal(t, wantInstallation, dialer.headers[0].Get("x-codex-installation-id"))
+
+			headers.Set("session-id", "different-client")
+			client, write, read, proxyErr = startOpenAIWSIngressSession(t, svc, account, headers, nil)
+			write(`{"type":"response.create","model":"gpt-5.1","store":false,"input":"other"}`)
+			require.Equal(t, "resp_fp_other", gjson.GetBytes(read(), "response.id").String())
+			require.NoError(t, client.Close(coderws.StatusNormalClosure, "done"))
+			require.NoError(t, waitOpenAIWSHTTPBridgeProxyErr(t, proxyErr))
+			require.Equal(t, 3, dialer.DialCount())
+			require.Zero(t, pool.SnapshotMetrics().ScaleUpTotal)
+		})
+	}
+}
+
 func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_LeaseLossSendsRetryClose(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1664,7 +1858,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledPre
 
 	captureConn := &openAIWSCaptureConn{
 		events: [][]byte{
-			[]byte(`{"type":"response.completed","response":{"id":"resp_preflight_rewrite_1","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+			[]byte(`{"type":"response.completed","response":{"id":"resp_preflight_rewrite_1","model":"gpt-5.1","output":[{"type":"reasoning","id":"rs_replay"},{"type":"message","id":"msg_replay","role":"assistant","content":[{"type":"output_text","text":"prior answer"}]},{"type":"function_call","id":"fc_replay","call_id":"call_replay","name":"test","arguments":"{}"}],"usage":{"input_tokens":1,"output_tokens":1}}}`),
 			[]byte(`{"type":"response.completed","response":{"id":"resp_preflight_rewrite_2","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
 		},
 	}
@@ -1759,7 +1953,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledPre
 	firstTurn := readMessage()
 	require.Equal(t, "resp_preflight_rewrite_1", gjson.GetBytes(firstTurn, "response.id").String())
 
-	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"store":false,"previous_response_id":"resp_stale_external","input":[{"type":"input_text","text":"world"}]}`)
+	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"store":false,"previous_response_id":"resp_preflight_rewrite_1","reasoning":{"effort":"high"},"input":[{"type":"input_text","text":"world"}]}`)
 	secondTurn := readMessage()
 	require.Equal(t, "resp_preflight_rewrite_2", gjson.GetBytes(secondTurn, "response.id").String())
 
@@ -1775,9 +1969,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledPre
 	require.Len(t, captureConn.writes, 2)
 	secondWrite := requestToJSONString(captureConn.writes[1])
 	require.False(t, gjson.Get(secondWrite, "previous_response_id").Exists(), "严格增量不成立时应移除 previous_response_id，改为 full create")
-	require.Equal(t, 2, len(gjson.Get(secondWrite, "input").Array()), "严格降级为 full create 时应重放完整 input 上下文")
-	require.Equal(t, "hello", gjson.Get(secondWrite, "input.0.text").String())
-	require.Equal(t, "world", gjson.Get(secondWrite, "input.1.text").String())
+	requireOpenAIWSReplayHistory(t, secondWrite)
 }
 
 func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledPrevResponseStrictDropBeforePreflightPingFailReconnects(t *testing.T) {
@@ -3031,7 +3223,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledStr
 
 	firstConn := &openAIWSPreflightFailConn{
 		events: [][]byte{
-			[]byte(`{"type":"response.completed","response":{"id":"resp_turn_ping_strict_1","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+			[]byte(`{"type":"response.completed","response":{"id":"resp_turn_ping_strict_1","model":"gpt-5.1","output":[{"type":"reasoning","id":"rs_replay"},{"type":"message","id":"msg_replay","role":"assistant","content":[{"type":"output_text","text":"prior answer"}]},{"type":"function_call","id":"fc_replay","call_id":"call_replay","name":"test","arguments":"{}"}],"usage":{"input_tokens":1,"output_tokens":1}}}`),
 		},
 	}
 	secondConn := &openAIWSCaptureConn{
@@ -3153,9 +3345,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledStr
 	require.Len(t, secondWrites, 1)
 	secondWrite := requestToJSONString(secondWrites[0])
 	require.False(t, gjson.Get(secondWrite, "previous_response_id").Exists(), "自动恢复重放应移除 previous_response_id")
-	require.Equal(t, 2, len(gjson.Get(secondWrite, "input").Array()), "自动恢复重放应使用完整 input 上下文")
-	require.Equal(t, "hello", gjson.Get(secondWrite, "input.0.text").String())
-	require.Equal(t, "world", gjson.Get(secondWrite, "input.1.text").String())
+	requireOpenAIWSReplayHistory(t, secondWrite)
 }
 
 func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledPreflightPingFailReplaysFunctionCallOutputWithContext(t *testing.T) {
@@ -3787,7 +3977,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_PreviousResponse
 
 	firstConn := &openAIWSCaptureConn{
 		events: [][]byte{
-			[]byte(`{"type":"response.completed","response":{"id":"resp_turn_prev_recover_1","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+			[]byte(`{"type":"response.completed","response":{"id":"resp_turn_prev_recover_1","model":"gpt-5.1","output":[{"type":"reasoning","id":"rs_replay"},{"type":"message","id":"msg_replay","role":"assistant","content":[{"type":"output_text","text":"prior answer"}]},{"type":"function_call","id":"fc_replay","call_id":"call_replay","name":"test","arguments":"{}"}],"usage":{"input_tokens":1,"output_tokens":1}}}`),
 			[]byte(`{"type":"error","error":{"type":"invalid_request_error","code":"previous_response_not_found","message":""}}`),
 		},
 	}
@@ -3885,11 +4075,11 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_PreviousResponse
 		return message
 	}
 
-	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"previous_response_id":"resp_seed_anchor"}`)
+	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"previous_response_id":"resp_seed_anchor","input":[{"type":"input_text","text":"hello"}]}`)
 	firstTurn := readMessage()
 	require.Equal(t, "resp_turn_prev_recover_1", gjson.GetBytes(firstTurn, "response.id").String())
 
-	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"previous_response_id":"resp_turn_prev_recover_1"}`)
+	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"previous_response_id":"resp_turn_prev_recover_1","input":[{"type":"input_text","text":"world"}]}`)
 	secondTurn := readMessage()
 	require.Equal(t, "response.completed", gjson.GetBytes(secondTurn, "type").String())
 	require.Equal(t, "resp_turn_prev_recover_2", gjson.GetBytes(secondTurn, "response.id").String())
@@ -3915,6 +4105,17 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_PreviousResponse
 	secondConn.mu.Unlock()
 	require.Len(t, secondWrites, 1, "恢复重试应在第二个连接发送一次请求")
 	require.False(t, gjson.Get(requestToJSONString(secondWrites[0]), "previous_response_id").Exists(), "恢复重试应移除 previous_response_id")
+	requireOpenAIWSReplayHistory(t, requestToJSONString(secondWrites[0]))
+}
+
+func requireOpenAIWSReplayHistory(t *testing.T, body string) {
+	t.Helper()
+	input := gjson.Get(body, "input").Array()
+	require.Len(t, input, 4)
+	require.Equal(t, "hello", input[0].Get("text").String())
+	require.Equal(t, "rs_replay", input[1].Get("id").String())
+	require.Equal(t, "msg_replay", input[2].Get("id").String())
+	require.Equal(t, "world", input[3].Get("text").String())
 }
 
 func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledStrictAffinityPreviousResponseNotFoundLayer2Recovery(t *testing.T) {
@@ -4318,6 +4519,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_RejectsMessageID
 type openAIWSQueueDialer struct {
 	mu        sync.Mutex
 	conns     []openAIWSClientConn
+	headers   []http.Header
 	dialCount int
 }
 
@@ -4329,11 +4531,11 @@ func (d *openAIWSQueueDialer) Dial(
 ) (openAIWSClientConn, int, http.Header, error) {
 	_ = ctx
 	_ = wsURL
-	_ = headers
 	_ = proxyURL
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.dialCount++
+	d.headers = append(d.headers, cloneHeader(headers))
 	if len(d.conns) == 0 {
 		return nil, 503, nil, errors.New("no test conn")
 	}

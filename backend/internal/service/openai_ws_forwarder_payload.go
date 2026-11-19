@@ -404,9 +404,9 @@ func openAIWSPayloadCodexWindowID(payload []byte) string {
 // while HTTP starts the new window without that continuation anchor.
 func normalizeOpenAIWSContextWindowBoundary(
 	payload []byte,
+	currentWindowID string,
 	previousWindowID string,
 ) ([]byte, openAIWSContextWindowBoundary, error) {
-	currentWindowID := openAIWSPayloadCodexWindowID(payload)
 	boundary := openAIWSContextWindowBoundary{WindowID: currentWindowID}
 	if previousWindowID == "" || currentWindowID == "" || currentWindowID == previousWindowID {
 		return payload, boundary, nil

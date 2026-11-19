@@ -367,6 +367,8 @@ gateway:
     mode_router_v2_enabled: false
     # ingress 默认模式：off|ctx_pool|passthrough|http_bridge（仅 mode_router_v2_enabled=true 生效；关闭时账号级 WS mode 被忽略）
     # 兼容旧值：shared/dedicated 会按 ctx_pool 处理。
+    # 灰度启用模式路由时，若现有 WS 账号需默认继续使用桥接，显式设置为 http_bridge，
+    # 再逐个账号启用 ctx_pool。原本未开放 WS 的账号应继续设为 off。
     ingress_mode_default: ctx_pool
     # 完整读取并解压首条客户端消息的总超时（秒）；大请求或慢链路可调高到 120-300。
     client_first_message_timeout_seconds: 30

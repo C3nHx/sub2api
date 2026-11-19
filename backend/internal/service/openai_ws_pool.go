@@ -1853,6 +1853,9 @@ func (p *openAIWSConnPool) ensureTargetIdleAsync(accountID int64) {
 	if ap.lastAcquire == nil {
 		return
 	}
+	if ap.lastAcquire.Account.GetCodexFingerprintMode() == codexFingerprintSession {
+		return
+	}
 	if ap.prewarmActive {
 		return
 	}
