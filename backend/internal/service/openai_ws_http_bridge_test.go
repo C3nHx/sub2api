@@ -850,6 +850,83 @@ func waitOpenAIWSHTTPBridgeProxyErr(t *testing.T, errCh <-chan error) error {
 	}
 }
 
+func TestOpenAIWSHTTPBridgeWindowRollover(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		headers  http.Header
+		metadata string
+	}{
+		{
+			name:    "window from standalone handshake header",
+			headers: http.Header{"X-Codex-Window-Id": {"old"}},
+		},
+		{
+			name:     "window from handshake metadata applied to first frame",
+			headers:  http.Header{"X-Codex-Turn-Metadata": {`{"window_id":"old"}`}},
+			metadata: `,"client_metadata":{"x-codex-turn-metadata":"{\"window_id\":\"new\"}"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := &httpUpstreamRecorder{}
+			for _, responseID := range []string{"resp_old", "resp_new"} {
+				sse := fmt.Sprintf("data: {\"type\":\"response.completed\",\"response\":{\"id\":%q,\"output\":[{\"type\":\"message\",\"id\":\"msg_history\",\"role\":\"assistant\"}]}}\n\n", responseID)
+				upstream.responses = append(upstream.responses, &http.Response{
+					StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(strings.NewReader(sse)),
+				})
+			}
+			cfg := &config.Config{}
+			cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+			cfg.Gateway.OpenAIWS.IngressModeDefault = OpenAIWSIngressModeHTTPBridge
+			svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: upstream, cache: &stubGatewayCache{}}
+			account := &Account{ID: 91, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1}
+			client, write, read, proxyErr := startOpenAIWSIngressSession(t, svc, account, tc.headers, nil)
+			write(`{"type":"response.create","model":"gpt-5.1","input":"old"` + tc.metadata + `}`)
+			require.Equal(t, "resp_old", gjson.GetBytes(read(), "response.id").String())
+			write(`{"type":"response.create","model":"gpt-5.1","previous_response_id":"resp_old","input":"new","client_metadata":{"x-codex-turn-metadata":"{\"window_id\":\"new\"}"}}`)
+			require.Equal(t, "resp_new", gjson.GetBytes(read(), "response.id").String())
+			require.NoError(t, client.Close(coderws.StatusNormalClosure, "done"))
+			require.NoError(t, waitOpenAIWSHTTPBridgeProxyErr(t, proxyErr))
+
+			require.Len(t, upstream.bodies, 2)
+			require.Equal(t, "new", gjson.GetBytes(upstream.bodies[1], "input").String())
+			require.False(t, gjson.GetBytes(upstream.bodies[1], "previous_response_id").Exists())
+			require.NotContains(t, string(upstream.bodies[1]), "msg_history")
+		})
+	}
+}
+
+func TestOpenAIWSReplayCollectorTerminalOutput(t *testing.T) {
+	for _, tc := range []struct {
+		eventType, payload string
+		wantIDs            []string
+	}{
+		{
+			eventType: "response.done",
+			payload:   `{"response":{"usage":{"input_tokens":1}}}`,
+			wantIDs:   []string{"rs_first", "msg_second"},
+		},
+		{
+			eventType: "response.incomplete",
+			payload:   `{"response":{"output":[{"type":"reasoning","id":"rs_first"},{"type":"message","id":"msg_second"},{"type":"message","id":"msg_partial"}]}}`,
+			wantIDs:   []string{"rs_first", "msg_second", "msg_partial"},
+		},
+	} {
+		t.Run(tc.eventType, func(t *testing.T) {
+			var collector openAIWSReplayCollector
+			collector.AddEvent("response.output_item.done", []byte(`{"output_index":1,"item":{"type":"message","id":"msg_second"}}`))
+			collector.AddEvent("response.output_item.done", []byte(`{"output_index":0,"item":{"type":"reasoning","id":"rs_first"}}`))
+			collector.AddEvent(tc.eventType, []byte(tc.payload))
+			items := collector.AllItems()
+			ids := make([]string, 0, len(items))
+			for _, item := range items {
+				ids = append(ids, gjson.GetBytes(item, "id").String())
+			}
+			require.Equal(t, tc.wantIDs, ids)
+		})
+	}
+}
+
 func TestOpenAIWSHTTPBridgeFirstRequestAfterPrewarmKeepsFirstTurnFailover(t *testing.T) {
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
 		StatusCode: http.StatusInternalServerError,

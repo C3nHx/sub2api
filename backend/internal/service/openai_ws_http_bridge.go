@@ -2,11 +2,13 @@ package service
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"slices"
 	"strconv"
@@ -291,29 +293,38 @@ func buildOpenAIWSHTTPBridgePrewarmEvents(model string) (string, [][]byte, error
 }
 
 type openAIWSReplayCollector struct {
-	items []json.RawMessage
+	items []openAIWSReplayItem
 	seen  map[string]struct{}
+}
+
+type openAIWSReplayItem struct {
+	index int
+	raw   json.RawMessage
 }
 
 func (c *openAIWSReplayCollector) AddEvent(eventType string, message []byte) {
 	switch strings.TrimSpace(eventType) {
 	case "response.output_item.done":
-		c.addItem(gjson.GetBytes(message, "item"))
-	case "response.completed", "response.done":
+		index := math.MaxInt
+		if value := gjson.GetBytes(message, "output_index"); value.Type == gjson.Number && value.Int() >= 0 && value.Int() < math.MaxInt {
+			index = int(value.Int())
+		}
+		c.addItem(gjson.GetBytes(message, "item"), index)
+	case "response.completed", "response.done", "response.incomplete":
 		output := gjson.GetBytes(message, "response.output")
 		if !output.IsArray() {
 			return
 		}
 		// The final output array is in response order even if items finish out of order.
 		var completed openAIWSReplayCollector
-		for _, item := range output.Array() {
-			completed.addItem(item)
+		for index, item := range output.Array() {
+			completed.addItem(item, index)
 		}
 		if len(completed.items) == 0 {
 			return
 		}
 		for _, item := range c.items {
-			completed.addItem(gjson.ParseBytes(item))
+			completed.addItem(gjson.ParseBytes(item.raw), item.index)
 		}
 		*c = completed
 	}
@@ -322,10 +333,18 @@ func (c *openAIWSReplayCollector) AddEvent(eventType string, message []byte) {
 // AllItems 返回浅拷贝头数组；正文由 collector 独立分配且此后不可变，
 // 调用方按 replay 所有权不变式共享持有。
 func (c *openAIWSReplayCollector) AllItems() []json.RawMessage {
-	return slices.Clone(c.items)
+	if len(c.items) == 0 {
+		return nil
+	}
+	slices.SortStableFunc(c.items, func(a, b openAIWSReplayItem) int { return cmp.Compare(a.index, b.index) })
+	items := make([]json.RawMessage, len(c.items))
+	for i, item := range c.items {
+		items[i] = item.raw
+	}
+	return items
 }
 
-func (c *openAIWSReplayCollector) addItem(item gjson.Result) {
+func (c *openAIWSReplayCollector) addItem(item gjson.Result, index int) {
 	if !item.Exists() || item.Type != gjson.JSON {
 		return
 	}
@@ -347,7 +366,7 @@ func (c *openAIWSReplayCollector) addItem(item gjson.Result) {
 		return
 	}
 	c.seen[key] = struct{}{}
-	c.items = append(c.items, json.RawMessage(raw))
+	c.items = append(c.items, openAIWSReplayItem{index: index, raw: json.RawMessage(raw)})
 }
 
 func buildOpenAIWSHTTPBridgeErrorEvent(statusCode int, message string) []byte {

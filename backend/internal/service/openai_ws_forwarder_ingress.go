@@ -332,9 +332,12 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", setErr)
 			}
 			normalized = next
-			if turn == 1 && clientWindowID == "" {
+			if turn == 1 {
 				clientWindowID = openAIWSPayloadCodexWindowID(normalized)
 			}
+		}
+		if turn == 1 && clientWindowID == "" {
+			clientWindowID = strings.TrimSpace(c.GetHeader("x-codex-window-id"))
 		}
 		turnMetadata := strings.TrimSpace(gjson.GetBytes(normalized, turnMetadataPath).String())
 		accountIdentitySourceRaw := append([]byte(nil), normalized...)
@@ -605,6 +608,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		bridgeReplayInputExists := false
 		var bridgeAccountFailoverInput []json.RawMessage
 		bridgeAccountFailoverInputExists := false
+		lastBridgeWindowID := ""
 		// readNextBridgePayload 读取下一条客户端请求；客户端正常断开时 closed=true。
 		readNextBridgePayload := func(nextTurn int) (payload openAIWSClientPayload, closed bool, err error) {
 			nextClientMessage, readErr := readClientMessage()
@@ -636,6 +640,24 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				if err := hooks.BeforeRequest(turn, currentBridgePayload.rawForHash, currentBridgePayload.originalModel); err != nil {
 					return err
 				}
+			}
+			boundaryPayload, boundary, boundaryErr := normalizeOpenAIWSContextWindowBoundary(
+				currentBridgePayload.payloadRaw,
+				currentBridgePayload.clientWindowID,
+				lastBridgeWindowID,
+			)
+			if boundaryErr != nil {
+				return fmt.Errorf("normalize Codex websocket bridge context-window boundary: %w", boundaryErr)
+			}
+			if boundary.WindowID != "" {
+				lastBridgeWindowID = boundary.WindowID
+			}
+			if boundary.Changed {
+				currentBridgePayload.payloadRaw = boundaryPayload
+				currentBridgePayload.payloadBytes = len(boundaryPayload)
+				currentBridgePayload.previousResponseID = ""
+				bridgeReplayInput, bridgeReplayInputExists = nil, false
+				bridgeAccountFailoverInput, bridgeAccountFailoverInputExists = nil, false
 			}
 			if isOpenAIWSHTTPBridgePrewarmPayload(currentBridgePayload.payloadRaw) {
 				// 预热不发上游、不记用量，只在本地应答，并把预热携带的 input 记入
