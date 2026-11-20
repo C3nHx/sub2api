@@ -28,16 +28,20 @@ func (s *updateServiceCacheStub) SetUpdateInfo(_ context.Context, data string, _
 }
 
 type updateServiceGitHubClientStub struct {
-	release        *GitHubRelease
-	recentReleases []*GitHubRelease
-	recentErr      error
+	release          *GitHubRelease
+	recentReleases   []*GitHubRelease
+	recentErr        error
+	lastLatestRepo   string
+	lastRecentRepo   string
 }
 
-func (s *updateServiceGitHubClientStub) FetchLatestRelease(context.Context, string) (*GitHubRelease, error) {
+func (s *updateServiceGitHubClientStub) FetchLatestRelease(_ context.Context, repo string) (*GitHubRelease, error) {
+	s.lastLatestRepo = repo
 	return s.release, nil
 }
 
-func (s *updateServiceGitHubClientStub) FetchRecentReleases(context.Context, string, int) ([]*GitHubRelease, error) {
+func (s *updateServiceGitHubClientStub) FetchRecentReleases(_ context.Context, repo string, _ int) ([]*GitHubRelease, error) {
+	s.lastRecentRepo = repo
 	return s.recentReleases, s.recentErr
 }
 
@@ -184,4 +188,48 @@ func TestUpdateServiceRollbackToVersionAcceptsVPrefix(t *testing.T) {
 	require.Error(t, err)
 	require.NotErrorIs(t, err, ErrRollbackVersionNotAllowed)
 	require.Contains(t, err.Error(), "no compatible release found")
+}
+
+func TestUpdateServiceGitHubRepoResolution(t *testing.T) {
+	t.Run("default uses fork repository", func(t *testing.T) {
+		t.Setenv("UPDATE_GITHUB_REPO", "")
+		client := &updateServiceGitHubClientStub{
+			release:        &GitHubRelease{TagName: "v0.2.24"},
+			recentReleases: []*GitHubRelease{{TagName: "v0.2.23"}},
+		}
+		svc := NewUpdateService(&updateServiceCacheStub{}, client, "0.2.24", "release")
+
+		_, err := svc.CheckUpdate(context.Background(), true)
+		require.NoError(t, err)
+		require.Equal(t, defaultGitHubRepo, client.lastLatestRepo)
+
+		_, err = svc.ListRollbackVersions(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, defaultGitHubRepo, client.lastRecentRepo)
+	})
+
+	t.Run("env overrides repository", func(t *testing.T) {
+		t.Setenv("UPDATE_GITHUB_REPO", "Wei-Shaw/sub2api")
+		client := &updateServiceGitHubClientStub{
+			release: &GitHubRelease{TagName: "v0.2.24"},
+		}
+		svc := NewUpdateService(&updateServiceCacheStub{}, client, "0.2.24", "release")
+
+		_, err := svc.CheckUpdate(context.Background(), true)
+		require.NoError(t, err)
+		require.Equal(t, "Wei-Shaw/sub2api", client.lastLatestRepo)
+	})
+
+	t.Run("invalid env falls back to default", func(t *testing.T) {
+		for _, bad := range []string{"invalid", "a/b/c", "/repo", "owner/", "owner/../repo", "owner/repo?x=1"} {
+			t.Setenv("UPDATE_GITHUB_REPO", bad)
+			client := &updateServiceGitHubClientStub{
+				release: &GitHubRelease{TagName: "v0.2.24"},
+			}
+			svc := NewUpdateService(&updateServiceCacheStub{}, client, "0.2.24", "release")
+			_, err := svc.CheckUpdate(context.Background(), true)
+			require.NoError(t, err)
+			require.Equal(t, defaultGitHubRepo, client.lastLatestRepo, "input=%q", bad)
+		}
+	})
 }
