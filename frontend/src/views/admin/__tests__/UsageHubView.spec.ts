@@ -72,12 +72,39 @@ vi.mock('@/components/auth/TotpStepUpDialog.vue', () => ({
   })
 }))
 
+const routerLinkStub = defineComponent({
+  name: 'RouterLinkStub',
+  props: {
+    to: {
+      type: [String, Object],
+      default: ''
+    }
+  },
+  setup(_, { slots }) {
+    return () => h('a', { class: 'router-link-stub' }, slots.default?.())
+  }
+})
+
+const mountUsageHubView = () =>
+  mount(UsageHubView, {
+    global: {
+      stubs: {
+        RouterLink: routerLinkStub,
+        'router-link': routerLinkStub
+      }
+    }
+  })
+
 describe('UsageHubView', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     getConfig.mockResolvedValue({
       enabled: false,
       include_disabled: false,
+      self_service_enabled: true,
+      allow_magpie: true,
+      expose_reset_credits: false,
+      active_self_service_users: 2,
       has_key: false,
       masked_key: '',
       hub_path: '/v0/management',
@@ -123,7 +150,7 @@ describe('UsageHubView', () => {
   })
 
   it('loads hub config and displays Codex OAuth accounts', async () => {
-    const wrapper = mount(UsageHubView)
+    const wrapper = mountUsageHubView()
     await flushPromises()
 
     expect(getConfig).toHaveBeenCalledTimes(1)
@@ -137,6 +164,10 @@ describe('UsageHubView', () => {
     updateConfig.mockResolvedValue({
       enabled: true,
       include_disabled: false,
+      self_service_enabled: true,
+      allow_magpie: true,
+      expose_reset_credits: false,
+      active_self_service_users: 2,
       has_key: true,
       masked_key: 'hub-123456...abcd',
       generated_key: 'hub-1234567890abcdef',
@@ -148,7 +179,7 @@ describe('UsageHubView', () => {
       cache_ttl_seconds: 30
     })
 
-    const wrapper = mount(UsageHubView)
+    const wrapper = mountUsageHubView()
     await flushPromises()
 
     const checkbox = wrapper.find('[data-testid="hub-enabled-toggle"]')
@@ -172,7 +203,7 @@ describe('UsageHubView', () => {
       overview: await listAccounts()
     })
 
-    const wrapper = mount(UsageHubView)
+    const wrapper = mountUsageHubView()
     await flushPromises()
 
     await wrapper.find('[data-testid="preview-auth-files-btn"]').trigger('click')

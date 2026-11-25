@@ -7,6 +7,10 @@ import { apiClient } from '../client'
 export interface UsageHubConfig {
   enabled: boolean
   include_disabled: boolean
+  self_service_enabled: boolean
+  allow_magpie: boolean
+  expose_reset_credits: boolean
+  active_self_service_users: number
   has_key: boolean
   masked_key: string
   generated_key?: string
@@ -21,6 +25,9 @@ export interface UsageHubConfig {
 export interface UpdateUsageHubConfigPayload {
   enabled?: boolean
   include_disabled?: boolean
+  self_service_enabled?: boolean
+  allow_magpie?: boolean
+  expose_reset_credits?: boolean
 }
 
 export interface UsageHubWindowProgress {

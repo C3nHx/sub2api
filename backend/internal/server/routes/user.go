@@ -77,6 +77,19 @@ func RegisterUserRoutes(
 				passkeys.PATCH("/:id", h.Passkey.Rename)
 				passkeys.DELETE("/:id", h.Passkey.Delete)
 			}
+
+			// 用户自助用量 Hub（个人独立只读 Token 与自定义 Magpie 数据源 CPA 整形）
+			if h.UsageHub != nil {
+				usageHub := user.Group("/usage-hub")
+				{
+					usageHub.GET("/config", h.UsageHub.GetMyConfig)
+					usageHub.PUT("/config", h.UsageHub.UpdateMyConfig)
+					usageHub.POST("/key/regenerate", h.UsageHub.RegenerateMyKey)
+					usageHub.DELETE("/key", h.UsageHub.DeleteMyKey)
+					usageHub.POST("/magpie/test", h.UsageHub.TestMyMagpieSource)
+					usageHub.GET("/preview-auth-files", h.UsageHub.PreviewMyAuthFiles)
+				}
+			}
 		}
 
 		// API Key管理

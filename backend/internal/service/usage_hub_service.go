@@ -53,23 +53,30 @@ var usageHubAllowedUpstreamPaths = []string{
 
 // UsageHubConfig 管理端读取的用量 Hub 配置视图（敏感密钥仅返回脱敏摘要）。
 type UsageHubConfig struct {
-	Enabled             bool     `json:"enabled"`
-	IncludeDisabled     bool     `json:"include_disabled"`
-	HasKey              bool     `json:"has_key"`
-	MaskedKey           string   `json:"masked_key"`
-	GeneratedKey        string   `json:"generated_key,omitempty"` // 仅在自动初始化或轮换密钥时返回一次明文
-	HubPath             string   `json:"hub_path"`
-	AuthFilesPath       string   `json:"auth_files_path"`
-	APICallPath         string   `json:"api_call_path"`
-	SupportedPlatforms  []string `json:"supported_platforms"`
-	AllowedUpstreamURLs []string `json:"allowed_upstream_urls"`
-	CacheTTLSeconds     int      `json:"cache_ttl_seconds"`
+	Enabled                bool     `json:"enabled"`
+	IncludeDisabled        bool     `json:"include_disabled"`
+	SelfServiceEnabled     bool     `json:"self_service_enabled"`
+	AllowMagpie            bool     `json:"allow_magpie"`
+	ExposeResetCredits     bool     `json:"expose_reset_credits"`
+	ActiveSelfServiceUsers int64    `json:"active_self_service_users"`
+	HasKey                 bool     `json:"has_key"`
+	MaskedKey              string   `json:"masked_key"`
+	GeneratedKey           string   `json:"generated_key,omitempty"` // 仅在自动初始化或轮换密钥时返回一次明文
+	HubPath                string   `json:"hub_path"`
+	AuthFilesPath          string   `json:"auth_files_path"`
+	APICallPath            string   `json:"api_call_path"`
+	SupportedPlatforms     []string `json:"supported_platforms"`
+	AllowedUpstreamURLs    []string `json:"allowed_upstream_urls"`
+	CacheTTLSeconds        int      `json:"cache_ttl_seconds"`
 }
 
 // UpdateUsageHubConfigInput 管理端更新用量 Hub 配置的入参。
 type UpdateUsageHubConfigInput struct {
-	Enabled         *bool `json:"enabled"`
-	IncludeDisabled *bool `json:"include_disabled"`
+	Enabled            *bool `json:"enabled"`
+	IncludeDisabled    *bool `json:"include_disabled"`
+	SelfServiceEnabled *bool `json:"self_service_enabled"`
+	AllowMagpie        *bool `json:"allow_magpie"`
+	ExposeResetCredits *bool `json:"expose_reset_credits"`
 }
 
 // UsageHubIDTokenClaims 返回给 CLIProxyAPI 客户端（如 T3 Code）的脱敏 ID Token 声明结构。
@@ -103,6 +110,7 @@ type UsageHubAuthFile struct {
 	PlanType         string                 `json:"plan_type,omitempty"`
 	ChatGPTAccountID string                 `json:"chatgpt_account_id,omitempty"`
 	AccountID        string                 `json:"account_id,omitempty"`
+	ProjectID        string                 `json:"project_id,omitempty"`
 	IDToken          *UsageHubIDTokenClaims `json:"id_token,omitempty"`
 	CreatedAt        string                 `json:"created_at,omitempty"`
 	UpdatedAt        string                 `json:"updated_at,omitempty"`
@@ -198,15 +206,20 @@ type usageHubAPICallCacheEntry struct {
 }
 
 // UsageHubService 提供面向 T3 Code 等客户端的 CLIProxyAPI 兼容用量 Hub 服务，
-// 以及管理后台的全站 Codex OAuth 额度聚合视图。
+// 支持全站管理员旧 Key 与用户自助独立 Key（含自定义 Magpie 数据源 CPA 整形）。
 type UsageHubService struct {
 	settingRepo  SettingRepository
 	accountRepo  AccountRepository
 	quotaService *OpenAIQuotaService
+	userHubRepo  UserUsageHubRepository
+	encryptor    SecretEncryptor
 
-	cacheTTL     time.Duration
-	apiCallCache sync.Map // cacheKey -> *usageHubAPICallCacheEntry
-	apiCallSF    singleflight.Group
+	cacheTTL            time.Duration
+	apiCallCache        sync.Map // cacheKey -> *usageHubAPICallCacheEntry
+	apiCallSF           singleflight.Group
+	magpieCache         sync.Map // cacheKey -> *usageHubMagpieCacheEntry
+	magpieSF            singleflight.Group
+	magpieClientFactory func(allowPrivate bool) (*http.Client, error)
 }
 
 // NewUsageHubService 创建 UsageHubService 实例。
@@ -223,26 +236,30 @@ func NewUsageHubService(
 	}
 }
 
+// WithUserHub 绑定用户自助 Hub 仓储与密钥加密器。
+func (s *UsageHubService) WithUserHub(userHubRepo UserUsageHubRepository, encryptor SecretEncryptor) *UsageHubService {
+	if s == nil {
+		return nil
+	}
+	s.userHubRepo = userHubRepo
+	s.encryptor = encryptor
+	return s
+}
+
 // GetConfig 获取用量 Hub 当前配置与脱敏密钥状态。
 func (s *UsageHubService) GetConfig(ctx context.Context) (*UsageHubConfig, error) {
 	if s == nil || s.settingRepo == nil {
 		return nil, infraerrors.InternalServer("USAGE_HUB_NOT_CONFIGURED", "usage hub service is not configured")
 	}
 
-	values, err := s.settingRepo.GetMultiple(ctx, []string{
-		SettingKeyUsageHubEnabled,
-		SettingKeyUsageHubManagementKey,
-		SettingKeyUsageHubIncludeDisabled,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("load usage hub settings: %w", err)
+	policy := s.loadHubPolicy(ctx)
+	var activeUsers int64
+	if s.userHubRepo != nil {
+		if count, err := s.userHubRepo.CountEnabled(ctx); err == nil {
+			activeUsers = count
+		}
 	}
-
-	rawKey := strings.TrimSpace(values[SettingKeyUsageHubManagementKey])
-	enabled := strings.EqualFold(strings.TrimSpace(values[SettingKeyUsageHubEnabled]), "true")
-	includeDisabled := strings.EqualFold(strings.TrimSpace(values[SettingKeyUsageHubIncludeDisabled]), "true")
-
-	return s.buildConfigResponse(enabled, includeDisabled, rawKey, ""), nil
+	return s.buildConfigResponse(policy, activeUsers, ""), nil
 }
 
 // UpdateConfig 更新用量 Hub 开关与暴露范围配置。
@@ -252,38 +269,38 @@ func (s *UsageHubService) UpdateConfig(ctx context.Context, input UpdateUsageHub
 		return nil, infraerrors.InternalServer("USAGE_HUB_NOT_CONFIGURED", "usage hub service is not configured")
 	}
 
-	values, err := s.settingRepo.GetMultiple(ctx, []string{
-		SettingKeyUsageHubEnabled,
-		SettingKeyUsageHubManagementKey,
-		SettingKeyUsageHubIncludeDisabled,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("load usage hub settings: %w", err)
-	}
-
-	enabled := strings.EqualFold(strings.TrimSpace(values[SettingKeyUsageHubEnabled]), "true")
-	includeDisabled := strings.EqualFold(strings.TrimSpace(values[SettingKeyUsageHubIncludeDisabled]), "true")
-	rawKey := strings.TrimSpace(values[SettingKeyUsageHubManagementKey])
-
+	policy := s.loadHubPolicy(ctx)
 	if input.Enabled != nil {
-		enabled = *input.Enabled
+		policy.GlobalEnabled = *input.Enabled
 	}
 	if input.IncludeDisabled != nil {
-		includeDisabled = *input.IncludeDisabled
+		policy.GlobalIncludeDisabled = *input.IncludeDisabled
+	}
+	if input.SelfServiceEnabled != nil {
+		policy.SelfServiceEnabled = *input.SelfServiceEnabled
+	}
+	if input.AllowMagpie != nil {
+		policy.AllowMagpie = *input.AllowMagpie
+	}
+	if input.ExposeResetCredits != nil {
+		policy.GlobalExposeReset = *input.ExposeResetCredits
 	}
 
 	updates := map[string]string{
-		SettingKeyUsageHubEnabled:         strconv.FormatBool(enabled),
-		SettingKeyUsageHubIncludeDisabled: strconv.FormatBool(includeDisabled),
+		SettingKeyUsageHubEnabled:            strconv.FormatBool(policy.GlobalEnabled),
+		SettingKeyUsageHubIncludeDisabled:    strconv.FormatBool(policy.GlobalIncludeDisabled),
+		SettingKeyUsageHubSelfServiceEnabled: strconv.FormatBool(policy.SelfServiceEnabled),
+		SettingKeyUsageHubAllowMagpie:        strconv.FormatBool(policy.AllowMagpie),
+		SettingKeyUsageHubExposeResetCredits: strconv.FormatBool(policy.GlobalExposeReset),
 	}
 
 	var generatedKey string
-	if enabled && rawKey == "" {
+	if policy.GlobalEnabled && policy.GlobalManagementKey == "" {
 		newKey, genErr := generateUsageHubManagementKey()
 		if genErr != nil {
 			return nil, fmt.Errorf("generate usage hub key: %w", genErr)
 		}
-		rawKey = newKey
+		policy.GlobalManagementKey = newKey
 		generatedKey = newKey
 		updates[SettingKeyUsageHubManagementKey] = newKey
 	}
@@ -292,7 +309,13 @@ func (s *UsageHubService) UpdateConfig(ctx context.Context, input UpdateUsageHub
 		return nil, fmt.Errorf("save usage hub settings: %w", err)
 	}
 
-	return s.buildConfigResponse(enabled, includeDisabled, rawKey, generatedKey), nil
+	var activeUsers int64
+	if s.userHubRepo != nil {
+		if count, err := s.userHubRepo.CountEnabled(ctx); err == nil {
+			activeUsers = count
+		}
+	}
+	return s.buildConfigResponse(policy, activeUsers, generatedKey), nil
 }
 
 // RegenerateKey 生成或轮换用量 Hub 专属管理密钥，明文仅在本次响应返回一次。
@@ -328,65 +351,192 @@ func (s *UsageHubService) DeleteKey(ctx context.Context) error {
 	return nil
 }
 
-// ValidateManagementKey 校验对外 CLIProxyAPI 兼容请求携带的管理密钥。
+// ValidateManagementKey 校验对外 CLIProxyAPI 兼容请求携带的管理密钥（兼容旧调用方）。
 func (s *UsageHubService) ValidateManagementKey(ctx context.Context, candidate string) error {
+	_, err := s.AuthenticateManagementKey(ctx, candidate)
+	return err
+}
+
+// AuthenticateManagementKey 校验对外请求携带的 Hub Key，同时支持用户自助密钥（hubu-...）
+// 与保留兼容的全站管理员旧密钥（hub-...），并返回该主体的访问范围与数据源配置。
+func (s *UsageHubService) AuthenticateManagementKey(ctx context.Context, candidate string) (*UsageHubPrincipal, error) {
 	if s == nil || s.settingRepo == nil {
-		return ErrUsageHubDisabled
+		return nil, ErrUsageHubDisabled
 	}
 
-	values, err := s.settingRepo.GetMultiple(ctx, []string{
-		SettingKeyUsageHubEnabled,
-		SettingKeyUsageHubManagementKey,
-	})
-	if err != nil {
-		return fmt.Errorf("load usage hub auth config: %w", err)
-	}
-
-	enabled := strings.EqualFold(strings.TrimSpace(values[SettingKeyUsageHubEnabled]), "true")
-	storedKey := strings.TrimSpace(values[SettingKeyUsageHubManagementKey])
-	if !enabled || storedKey == "" {
-		return ErrUsageHubDisabled
-	}
-
+	policy := s.loadHubPolicy(ctx)
 	candidate = strings.TrimSpace(candidate)
-	if candidate == "" || len(candidate) != len(storedKey) {
-		return ErrUsageHubUnauthorized
-	}
-	if subtle.ConstantTimeCompare([]byte(candidate), []byte(storedKey)) != 1 {
-		return ErrUsageHubUnauthorized
-	}
-	return nil
-}
 
-// ListAuthFiles 生成符合 CLIProxyAPI GET /v0/management/auth-files 规范的全站 Codex OAuth 账号列表。
-func (s *UsageHubService) ListAuthFiles(ctx context.Context) (*UsageHubAuthFilesResponse, error) {
-	if s == nil || s.accountRepo == nil {
-		return nil, infraerrors.InternalServer("USAGE_HUB_NOT_CONFIGURED", "usage hub service is not configured")
-	}
-
-	includeDisabled := s.isIncludeDisabledEnabled(ctx)
-	accounts, err := s.listCodexOAuthAccounts(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	files := make([]UsageHubAuthFile, 0, len(accounts))
-	for i := range accounts {
-		acc := &accounts[i]
-		if !includeDisabled && acc.Status == StatusDisabled {
-			continue
+	// 1. 优先匹配用户自助独立 Key（数据库仅存 SHA-256 哈希）。
+	if candidate != "" && s.userHubRepo != nil {
+		tokenHash := hashUsageHubToken(candidate)
+		rec, err := s.userHubRepo.GetByTokenHash(ctx, tokenHash)
+		if err == nil && rec != nil {
+			isAdmin := strings.EqualFold(strings.TrimSpace(rec.UserRole), RoleAdmin)
+			if !rec.Enabled {
+				return nil, ErrUsageHubDisabled
+			}
+			if !isAdmin && !policy.SelfServiceEnabled {
+				return nil, ErrUsageHubDisabled
+			}
+			return s.buildPrincipalFromUserRecord(rec, policy, isAdmin), nil
 		}
-		files = append(files, buildUsageHubAuthFile(acc))
+		if err != nil && !errors.Is(err, ErrUsageHubUserConfigNotFound) {
+			return nil, fmt.Errorf("lookup user usage hub key: %w", err)
+		}
 	}
 
-	return &UsageHubAuthFilesResponse{Files: files}, nil
+	// 2. 回退匹配全站管理员旧密钥，确保已配置 T3 Code 的管理员零中断升级。
+	if policy.GlobalEnabled && policy.GlobalManagementKey != "" {
+		if candidate != "" && len(candidate) == len(policy.GlobalManagementKey) &&
+			subtle.ConstantTimeCompare([]byte(candidate), []byte(policy.GlobalManagementKey)) == 1 {
+			return &UsageHubPrincipal{
+				Kind:               "global",
+				IsAdmin:            true,
+				IncludeSub2API:     true,
+				IncludeDisabled:    policy.GlobalIncludeDisabled,
+				ExposeResetCredits: policy.GlobalExposeReset,
+			}, nil
+		}
+	}
+
+	// 若全站旧 Hub 与用户自助模式均未开启，则返回 404（未启用），否则返回 401（密钥无效）。
+	selfServiceActive := s.userHubRepo != nil && policy.SelfServiceEnabled
+	if !policy.GlobalEnabled && !selfServiceActive {
+		return nil, ErrUsageHubDisabled
+	}
+	return nil, ErrUsageHubUnauthorized
 }
 
-// ExecuteAPICall 实现受白名单保护的 CLIProxyAPI POST /v0/management/api-call，
-// 使用账号已刷新且绑定代理的客户端向上游官方额度接口发起只读请求。
+// ListAuthFiles 生成符合 CLIProxyAPI GET /v0/management/auth-files 规范的全站 Codex OAuth 账号列表（全站管理员视图）。
+func (s *UsageHubService) ListAuthFiles(ctx context.Context) (*UsageHubAuthFilesResponse, error) {
+	policy := s.loadHubPolicy(ctx)
+	return s.ListAuthFilesForPrincipal(ctx, &UsageHubPrincipal{
+		Kind:               "global",
+		IsAdmin:            true,
+		IncludeSub2API:     true,
+		IncludeDisabled:    policy.GlobalIncludeDisabled,
+		ExposeResetCredits: policy.GlobalExposeReset,
+	})
+}
+
+// ListAuthFilesForPrincipal 按已认证主体（全站管理员或用户自助配置）聚合输出 CLIProxyAPI auth-files 列表。
+func (s *UsageHubService) ListAuthFilesForPrincipal(ctx context.Context, principal *UsageHubPrincipal) (*UsageHubAuthFilesResponse, error) {
+	res, _, err := s.listAuthFilesWithWarnings(ctx, principal)
+	return res, err
+}
+
+func (s *UsageHubService) listAuthFilesWithWarnings(
+	ctx context.Context,
+	principal *UsageHubPrincipal,
+) (*UsageHubAuthFilesResponse, []UsageHubPreviewWarning, error) {
+	if s == nil || s.accountRepo == nil {
+		return nil, nil, infraerrors.InternalServer("USAGE_HUB_NOT_CONFIGURED", "usage hub service is not configured")
+	}
+	if principal == nil {
+		return nil, nil, ErrUsageHubUnauthorized
+	}
+
+	files := make([]UsageHubAuthFile, 0, 16)
+	if principal.IncludeSub2API {
+		accounts, err := s.listCodexOAuthAccounts(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		for i := range accounts {
+			acc := &accounts[i]
+			if !principal.IncludeDisabled && acc.Status == StatusDisabled {
+				continue
+			}
+			files = append(files, buildUsageHubAuthFile(acc))
+		}
+	}
+
+	var warnings []UsageHubPreviewWarning
+	if len(principal.MagpieSources) > 0 {
+		type sourceResult struct {
+			index   int
+			files   []UsageHubAuthFile
+			warning *UsageHubPreviewWarning
+		}
+		results := make([]sourceResult, len(principal.MagpieSources))
+		var g errgroup.Group
+		g.SetLimit(usageHubBatchRefreshLimit)
+
+		for idx, source := range principal.MagpieSources {
+			i := idx
+			src := source
+			g.Go(func() error {
+				entries, err := s.fetchMagpieQuotasCached(ctx, principal.UserID, src, principal.IsAdmin)
+				if err != nil {
+					slog.Warn("usage_hub_magpie_source_failed", "user_id", principal.UserID, "source_id", src.ID, "error", err)
+					results[i] = sourceResult{
+						index: i,
+						warning: &UsageHubPreviewWarning{
+							SourceID:   src.ID,
+							SourceName: src.Name,
+							Message:    err.Error(),
+						},
+					}
+					return nil
+				}
+				matched := buildMagpieMatchedAccounts(src, entries)
+				srcFiles := make([]UsageHubAuthFile, 0, len(matched))
+				for _, item := range matched {
+					srcFiles = append(srcFiles, item.AuthFile)
+				}
+				results[i] = sourceResult{index: i, files: srcFiles}
+				return nil
+			})
+		}
+		_ = g.Wait()
+
+		for _, r := range results {
+			if r.warning != nil {
+				warnings = append(warnings, *r.warning)
+				continue
+			}
+			files = append(files, r.files...)
+		}
+		sortUsageHubWarnings(warnings)
+	}
+
+	return &UsageHubAuthFilesResponse{Files: files}, warnings, nil
+}
+
+// ExecuteAPICall 实现受白名单保护的 CLIProxyAPI POST /v0/management/api-call（全站默认主体）。
 func (s *UsageHubService) ExecuteAPICall(ctx context.Context, req UsageHubAPICallRequest) (*UsageHubAPICallResponse, error) {
+	policy := s.loadHubPolicy(ctx)
+	return s.ExecuteAPICallForPrincipal(ctx, &UsageHubPrincipal{
+		Kind:               "global",
+		IsAdmin:            true,
+		IncludeSub2API:     true,
+		IncludeDisabled:    policy.GlobalIncludeDisabled,
+		ExposeResetCredits: policy.GlobalExposeReset,
+	}, req)
+}
+
+// ExecuteAPICallForPrincipal 按主体分发 POST /v0/management/api-call：
+// - magpie:* 虚拟账号：从缓存的 Magpie 配额快照实时合成为对应平台（Codex / Claude / Antigravity）的只读 JSON；
+// - sub2api-codex-* 账号：走原 OpenAIQuotaService 只读白名单代理链路（受主体重置卡开关管控）。
+func (s *UsageHubService) ExecuteAPICallForPrincipal(
+	ctx context.Context,
+	principal *UsageHubPrincipal,
+	req UsageHubAPICallRequest,
+) (*UsageHubAPICallResponse, error) {
 	if s == nil || s.accountRepo == nil || s.quotaService == nil {
 		return nil, infraerrors.InternalServer("USAGE_HUB_NOT_CONFIGURED", "usage hub service is not configured")
+	}
+	if principal == nil {
+		return nil, ErrUsageHubUnauthorized
+	}
+
+	if rawAuthIdx, ok := extractRawUsageHubAuthIndexString(req.AuthIndex, req.AuthIndexAlt); ok && strings.HasPrefix(rawAuthIdx, usageHubMagpieAuthPrefix) {
+		return s.executeMagpieAPICall(ctx, principal, rawAuthIdx, req)
+	}
+
+	if !principal.IncludeSub2API {
+		return nil, ErrUsageHubAccountNotFound
 	}
 
 	accountID, err := parseUsageHubAuthIndex(req.AuthIndex, req.AuthIndexAlt)
@@ -406,6 +556,11 @@ func (s *UsageHubService) ExecuteAPICall(ctx context.Context, req UsageHubAPICal
 	if err != nil {
 		return nil, err
 	}
+	// 当主体未开启重置卡暴露开关时，拦截 /backend-api/wham/rate-limit-reset-credits，
+	// T3 Code 将自动隐藏 Codex 重置卡操作按钮而不影响正常额度展示。
+	if parsedURL.Path == "/backend-api/wham/rate-limit-reset-credits" && !principal.ExposeResetCredits {
+		return nil, ErrUsageHubForbiddenURL
+	}
 
 	account, err := s.accountRepo.GetByID(ctx, accountID)
 	if err != nil || account == nil {
@@ -414,7 +569,7 @@ func (s *UsageHubService) ExecuteAPICall(ctx context.Context, req UsageHubAPICal
 	if !isUsageHubCodexAccount(account) {
 		return nil, ErrUsageHubAccountNotFound
 	}
-	if !s.isIncludeDisabledEnabled(ctx) && account.Status == StatusDisabled {
+	if !principal.IncludeDisabled && account.Status == StatusDisabled {
 		return nil, ErrUsageHubAccountNotFound
 	}
 
@@ -800,23 +955,30 @@ func (s *UsageHubService) listCodexOAuthAccounts(ctx context.Context) ([]Account
 	return filtered, nil
 }
 
-func (s *UsageHubService) buildConfigResponse(enabled, includeDisabled bool, rawKey, generatedKey string) *UsageHubConfig {
+func (s *UsageHubService) buildConfigResponse(policy usageHubPolicy, activeUsers int64, generatedKey string) *UsageHubConfig {
 	allowedURLs := make([]string, 0, len(usageHubAllowedUpstreamPaths))
 	for _, p := range usageHubAllowedUpstreamPaths {
+		if p == "/backend-api/wham/rate-limit-reset-credits" && !policy.GlobalExposeReset {
+			continue
+		}
 		allowedURLs = append(allowedURLs, "https://chatgpt.com"+p)
 	}
 	return &UsageHubConfig{
-		Enabled:             enabled,
-		IncludeDisabled:     includeDisabled,
-		HasKey:              rawKey != "",
-		MaskedKey:           maskUsageHubKey(rawKey),
-		GeneratedKey:        generatedKey,
-		HubPath:             "/v0/management",
-		AuthFilesPath:       "/v0/management/auth-files",
-		APICallPath:         "/v0/management/api-call",
-		SupportedPlatforms:  []string{"codex"},
-		AllowedUpstreamURLs: allowedURLs,
-		CacheTTLSeconds:     int(s.cacheTTL.Seconds()),
+		Enabled:                policy.GlobalEnabled,
+		IncludeDisabled:        policy.GlobalIncludeDisabled,
+		SelfServiceEnabled:     policy.SelfServiceEnabled,
+		AllowMagpie:            policy.AllowMagpie,
+		ExposeResetCredits:     policy.GlobalExposeReset,
+		ActiveSelfServiceUsers: activeUsers,
+		HasKey:                 policy.GlobalManagementKey != "",
+		MaskedKey:              maskUsageHubKey(policy.GlobalManagementKey),
+		GeneratedKey:           generatedKey,
+		HubPath:                "/v0/management",
+		AuthFilesPath:          "/v0/management/auth-files",
+		APICallPath:            "/v0/management/api-call",
+		SupportedPlatforms:     []string{"codex"},
+		AllowedUpstreamURLs:    allowedURLs,
+		CacheTTLSeconds:        int(s.cacheTTL.Seconds()),
 	}
 }
 
@@ -1074,6 +1236,22 @@ func sanitizeAuthFileToken(raw string) string {
 		}
 	}
 	return strings.Trim(b.String(), "._-")
+}
+
+func extractRawUsageHubAuthIndexString(primary, fallback json.RawMessage) (string, bool) {
+	raw := primary
+	if len(bytesTrimSpace(raw)) == 0 {
+		raw = fallback
+	}
+	trimmed := string(bytesTrimSpace(raw))
+	if trimmed == "" || trimmed == "null" {
+		return "", false
+	}
+	var strVal string
+	if err := json.Unmarshal([]byte(trimmed), &strVal); err == nil {
+		return strings.TrimSpace(strVal), true
+	}
+	return "", false
 }
 
 func parseUsageHubAuthIndex(primary, fallback json.RawMessage) (int64, error) {

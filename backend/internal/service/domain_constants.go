@@ -766,10 +766,15 @@ const SettingKeyAllowUserViewErrorRequests = "allow_user_view_error_requests"
 
 // 用量 Hub（CLIProxyAPI 兼容层，对接 T3 Code 等外部用量中心）系统设置键。
 const (
-	SettingKeyUsageHubEnabled         = "usage_hub_enabled"
-	SettingKeyUsageHubManagementKey   = "usage_hub_management_key"
-	SettingKeyUsageHubIncludeDisabled = "usage_hub_include_disabled"
+	SettingKeyUsageHubEnabled            = "usage_hub_enabled"
+	SettingKeyUsageHubManagementKey      = "usage_hub_management_key"
+	SettingKeyUsageHubIncludeDisabled    = "usage_hub_include_disabled"
+	SettingKeyUsageHubSelfServiceEnabled = "usage_hub_self_service_enabled"
+	SettingKeyUsageHubAllowMagpie        = "usage_hub_allow_magpie"
+	SettingKeyUsageHubExposeResetCredits = "usage_hub_expose_reset_credits"
 
-	// UsageHubKeyPrefix 用量 Hub 专属只读管理密钥前缀，与管理员密钥及用户 API Key 区分。
+	// UsageHubKeyPrefix 全站管理员用量 Hub 只读管理密钥前缀，与管理员密钥及用户 API Key 区分。
 	UsageHubKeyPrefix = "hub-"
+	// UsageHubUserKeyPrefix 用户自助用量 Hub 专属只读密钥前缀。
+	UsageHubUserKeyPrefix = "hubu-"
 )

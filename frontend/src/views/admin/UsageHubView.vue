@@ -19,12 +19,18 @@
               >
                 {{ config.enabled ? t('admin.usageHub.statusEnabled') : t('admin.usageHub.statusDisabled') }}
               </span>
+              <span class="inline-flex items-center rounded-full bg-primary-50 px-2.5 py-0.5 text-xs font-medium text-primary-700 dark:bg-primary-900/30 dark:text-primary-300">
+                {{ t('admin.usageHub.activeSelfServiceUsersBadge', { count: config.active_self_service_users || 0 }) }}
+              </span>
             </div>
             <p class="text-sm text-gray-500 dark:text-gray-400">
               {{ t('admin.usageHub.configSubtitle') }}
             </p>
           </div>
           <div class="flex flex-wrap items-center gap-2">
+            <router-link to="/usage-hub" class="btn btn-secondary btn-sm">
+              {{ t('admin.usageHub.openPersonalHub') }}
+            </router-link>
             <button
               type="button"
               class="btn btn-secondary btn-sm"
@@ -47,7 +53,29 @@
         </div>
 
         <!-- 开关区 -->
-        <div class="mt-5 flex flex-wrap items-center gap-6 border-t border-gray-100 pt-4 dark:border-dark-700">
+        <div class="mt-5 flex flex-wrap items-center gap-x-6 gap-y-3 border-t border-gray-100 pt-4 dark:border-dark-700">
+          <label class="inline-flex cursor-pointer items-center gap-2.5 text-sm font-medium text-gray-800 dark:text-gray-200">
+            <input
+              type="checkbox"
+              class="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+              :checked="config.self_service_enabled"
+              :disabled="savingConfig"
+              data-testid="hub-self-service-toggle"
+              @change="handleUpdateConfigFlag({ self_service_enabled: ($event.target as HTMLInputElement).checked })"
+            />
+            <span>{{ t('admin.usageHub.selfServiceEnabledLabel') }}</span>
+          </label>
+          <label class="inline-flex cursor-pointer items-center gap-2.5 text-sm text-gray-700 dark:text-gray-300">
+            <input
+              type="checkbox"
+              class="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+              :checked="config.allow_magpie"
+              :disabled="savingConfig"
+              data-testid="hub-allow-magpie-toggle"
+              @change="handleUpdateConfigFlag({ allow_magpie: ($event.target as HTMLInputElement).checked })"
+            />
+            <span>{{ t('admin.usageHub.allowMagpieLabel') }}</span>
+          </label>
           <label class="inline-flex cursor-pointer items-center gap-2.5 text-sm font-medium text-gray-800 dark:text-gray-200">
             <input
               type="checkbox"
@@ -69,6 +97,17 @@
               @change="handleToggleIncludeDisabled(($event.target as HTMLInputElement).checked)"
             />
             <span>{{ t('admin.usageHub.includeDisabledLabel') }}</span>
+          </label>
+          <label class="inline-flex cursor-pointer items-center gap-2.5 text-sm text-gray-700 dark:text-gray-300">
+            <input
+              type="checkbox"
+              class="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+              :checked="config.expose_reset_credits"
+              :disabled="savingConfig"
+              data-testid="hub-expose-reset-toggle"
+              @change="handleUpdateConfigFlag({ expose_reset_credits: ($event.target as HTMLInputElement).checked })"
+            />
+            <span>{{ t('admin.usageHub.exposeResetCreditsLabel') }}</span>
           </label>
         </div>
 
@@ -578,6 +617,7 @@ import AppLayout from '@/components/layout/AppLayout.vue'
 import TotpStepUpDialog from '@/components/auth/TotpStepUpDialog.vue'
 import { adminAPI } from '@/api'
 import type {
+  UpdateUsageHubConfigPayload,
   UsageHubAccountItem,
   UsageHubConfig,
   UsageHubOverviewResponse
@@ -605,6 +645,10 @@ const refreshingAccountIds = ref<Set<number>>(new Set())
 const config = ref<UsageHubConfig>({
   enabled: false,
   include_disabled: false,
+  self_service_enabled: true,
+  allow_magpie: true,
+  expose_reset_credits: false,
+  active_self_service_users: 0,
   has_key: false,
   masked_key: '',
   hub_path: '/v0/management',
@@ -816,6 +860,19 @@ async function handleToggleIncludeDisabled(nextValue: boolean): Promise<void> {
     const updated = await adminAPI.usageHub.updateConfig({ include_disabled: nextValue })
     config.value = updated
     overview.value = await adminAPI.usageHub.listAccounts()
+    appStore.showSuccess(t('admin.usageHub.messages.configSaved'))
+  } catch (error) {
+    appStore.showError(extractErrorMessage(error))
+  } finally {
+    savingConfig.value = false
+  }
+}
+
+async function handleUpdateConfigFlag(payload: UpdateUsageHubConfigPayload): Promise<void> {
+  savingConfig.value = true
+  try {
+    const updated = await adminAPI.usageHub.updateConfig(payload)
+    config.value = updated
     appStore.showSuccess(t('admin.usageHub.messages.configSaved'))
   } catch (error) {
     appStore.showError(extractErrorMessage(error))

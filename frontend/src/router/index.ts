@@ -241,6 +241,18 @@ const routes: RouteRecordRaw[] = [
     }
   },
   {
+    path: '/usage-hub',
+    name: 'UserUsageHub',
+    component: () => import('@/views/user/UsageHubView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: false,
+      title: 'Usage Hub',
+      titleKey: 'usageHub.title',
+      descriptionKey: 'usageHub.description'
+    }
+  },
+  {
     path: '/redeem',
     name: 'Redeem',
     component: () => import('@/views/user/RedeemView.vue'),

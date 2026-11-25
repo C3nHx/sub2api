@@ -859,6 +859,17 @@ func ProvideAPIKeyService(
 	return svc
 }
 
+// ProvideUsageHubService 构造支持用户自助与 Magpie 外部数据源整形的用量 Hub 服务。
+func ProvideUsageHubService(
+	settingRepo SettingRepository,
+	accountRepo AccountRepository,
+	quotaService *OpenAIQuotaService,
+	userHubRepo UserUsageHubRepository,
+	encryptor SecretEncryptor,
+) *UsageHubService {
+	return NewUsageHubService(settingRepo, accountRepo, quotaService).WithUserHub(userHubRepo, encryptor)
+}
+
 // ProviderSet is the Wire provider set for all services
 var ProviderSet = wire.NewSet(
 	// Core services
@@ -995,7 +1006,7 @@ var ProviderSet = wire.NewSet(
 	ProvideUserPlatformQuotaUsageFlusher,
 	NewUsageBillingLaneCombiner,
 	ProvideUsageBillingRepository,
-	NewUsageHubService,
+	ProvideUsageHubService,
 )
 
 // ProvideUsageBillingRepository 以按用户合并结算的通道作为各服务使用的计费仓储。

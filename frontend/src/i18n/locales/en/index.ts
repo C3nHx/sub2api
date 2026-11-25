@@ -1,5 +1,6 @@
 import adminAccessKeys from './adminAccessKeys'
 import mcp from './mcp'
+import usageHub from './usageHub'
 import landing from './landing'
 import common from './common'
 import dashboard from './dashboard'
@@ -11,6 +12,7 @@ import misc from './misc'
 export default {
   adminAccessKeys,
   mcp,
+  usageHub,
   ...landing,
   ...common,
   ...dashboard,
