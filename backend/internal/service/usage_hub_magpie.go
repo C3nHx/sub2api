@@ -23,7 +23,7 @@ import (
 
 const (
 	usageHubMaxMagpieSources   = 5
-	usageHubMagpieTimeout      = 8 * time.Second
+	usageHubMagpieTimeout      = 15 * time.Second
 	usageHubMagpieMaxBodyBytes = 2 * 1024 * 1024
 	usageHubMagpieAuthPrefix   = "magpie:"
 
@@ -841,7 +841,26 @@ func (s *UsageHubService) fetchMagpieQuotasDirect(
 		return nil, fmt.Errorf("init magpie http client: %w", err)
 	}
 
-	endpoint := strings.TrimRight(baseURL, "/") + "/v1/magpie/quotas?kept=1"
+	root := strings.TrimRight(baseURL, "/")
+	// 优先读取 Magpie 缓存快照（?kept=1，零上游开销）；若刚启动缓存为空则回退拉取一次实时快照。
+	entries, err := fetchMagpieQuotasEndpoint(ctx, client, root+"/v1/magpie/quotas?kept=1", apiKey)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		if fresh, freshErr := fetchMagpieQuotasEndpoint(ctx, client, root+"/v1/magpie/quotas", apiKey); freshErr == nil && len(fresh) > 0 {
+			return fresh, nil
+		}
+	}
+	return entries, nil
+}
+
+func fetchMagpieQuotasEndpoint(
+	ctx context.Context,
+	client *http.Client,
+	endpoint string,
+	apiKey string,
+) ([]magpieQuotaEntry, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build magpie request: %w", err)
@@ -879,9 +898,62 @@ func (s *UsageHubService) fetchMagpieQuotasDirect(
 		return nil, fmt.Errorf("magpie returned HTTP %d", resp.StatusCode)
 	}
 
-	var entries []magpieQuotaEntry
-	if err := json.Unmarshal(rawBody, &entries); err != nil {
+	entries, err := decodeMagpieQuotasPayload(rawBody)
+	if err != nil {
 		return nil, fmt.Errorf("decode magpie quotas json: %w", err)
+	}
+	return entries, nil
+}
+
+// decodeMagpieQuotasPayload 兼容解析 Magpie HTTP 网关返回的 {"object":"list","data":[...]} 包装结构以及裸数组 [...] 格式。
+func decodeMagpieQuotasPayload(rawBody []byte) ([]magpieQuotaEntry, error) {
+	trimmed := strings.TrimSpace(string(rawBody))
+	if trimmed == "" || trimmed == "null" {
+		return []magpieQuotaEntry{}, nil
+	}
+
+	if strings.HasPrefix(trimmed, "[") {
+		var entries []magpieQuotaEntry
+		if err := json.Unmarshal([]byte(trimmed), &entries); err != nil {
+			return nil, err
+		}
+		if entries == nil {
+			return []magpieQuotaEntry{}, nil
+		}
+		return entries, nil
+	}
+
+	var envelope struct {
+		Data   json.RawMessage `json:"data"`
+		Quotas json.RawMessage `json:"quotas"`
+		Items  json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &envelope); err != nil {
+		return nil, err
+	}
+
+	listRaw := envelope.Data
+	if len(listRaw) == 0 {
+		listRaw = envelope.Quotas
+	}
+	if len(listRaw) == 0 {
+		listRaw = envelope.Items
+	}
+	if len(listRaw) == 0 {
+		return nil, errors.New("missing list field (data/quotas/items) in magpie response")
+	}
+
+	listTrimmed := strings.TrimSpace(string(listRaw))
+	if listTrimmed == "" || listTrimmed == "null" {
+		return []magpieQuotaEntry{}, nil
+	}
+
+	var entries []magpieQuotaEntry
+	if err := json.Unmarshal(listRaw, &entries); err != nil {
+		return nil, err
+	}
+	if entries == nil {
+		return []magpieQuotaEntry{}, nil
 	}
 	return entries, nil
 }
@@ -1473,12 +1545,17 @@ func normalizeCodexPlanType(plan string) string {
 }
 
 func normalizeMagpieProvider(raw string) string {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	// 远程 Magpie 卡片的 provider 格式为 "<remote>/<provider>"（如 "office/codex"），取末段归一化。
+	if idx := strings.LastIndex(trimmed, "/"); idx >= 0 && idx+1 < len(trimmed) {
+		trimmed = strings.TrimSpace(trimmed[idx+1:])
+	}
+	switch trimmed {
 	case "codex", "openai", "chatgpt":
 		return usageHubProviderCodex
 	case "claude", "anthropic", "claude-code", "claude_code":
 		return usageHubProviderClaude
-	case "antigravity", "agy":
+	case "antigravity", "agy", "google-antigravity":
 		return usageHubProviderAntigravity
 	default:
 		return ""

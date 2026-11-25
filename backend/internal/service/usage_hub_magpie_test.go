@@ -250,7 +250,10 @@ func TestUsageHubService_MagpieToCPAReshaping_CodexClaudeAntigravity(t *testing.
 			"windows":  []map[string]any{},
 		},
 	}
-	magpieJSON, err := json.Marshal(magpiePayload)
+	magpieJSON, err := json.Marshal(map[string]any{
+		"object": "list",
+		"data":   magpiePayload,
+	})
 	require.NoError(t, err)
 
 	var fetchCalls int
@@ -415,4 +418,58 @@ func TestUsageHubService_MagpieToCPAReshaping_CodexClaudeAntigravity(t *testing.
 		URL:       "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
 	})
 	require.ErrorIs(t, err, ErrUsageHubForbiddenURL)
+}
+
+func TestUsageHubService_MagpieDecodeAndKeptFallback(t *testing.T) {
+	// 1. 兼容 Magpie HTTP 网关包装格式 {"object":"list","data":[...]}、data=null 与裸数组 [...]
+	entries, err := decodeMagpieQuotasPayload([]byte(`{"object":"list","data":[{"provider":"office/codex","user":"a@example.com","kind":"subscription","windows":[]}]}`))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, usageHubProviderCodex, normalizeMagpieProvider(entries[0].Provider))
+	require.Equal(t, usageHubProviderAntigravity, normalizeMagpieProvider("office/google-antigravity"))
+
+	emptyEntries, err := decodeMagpieQuotasPayload([]byte(`{"object":"list","data":null}`))
+	require.NoError(t, err)
+	require.Empty(t, emptyEntries)
+
+	bareEntries, err := decodeMagpieQuotasPayload([]byte(`[{"provider":"claude","user":"b@example.com","kind":"subscription","windows":[]}]`))
+	require.NoError(t, err)
+	require.Len(t, bareEntries, 1)
+
+	_, err = decodeMagpieQuotasPayload([]byte(`{"unexpected":true}`))
+	require.Error(t, err)
+
+	// 2. 验证 ?kept=1 返回空列表时，自动回退拉取一次无 kept 参数的实时接口。
+	settingRepo := newUsageHubSettingRepoStub()
+	accountRepo := &usageHubAccountRepoStub{}
+	userRepo := newUsageHubUserRepoStub()
+	svc := NewUsageHubService(settingRepo, accountRepo, nil).WithUserHub(userRepo, usageHubEncryptorStub{})
+
+	var requestedURLs []string
+	svc.magpieClientFactory = func(_ bool) (*http.Client, error) {
+		return &http.Client{
+			Transport: usageHubRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				requestedURLs = append(requestedURLs, r.URL.RequestURI())
+				body := `{"object":"list","data":[]}`
+				if r.URL.Query().Get("kept") == "" {
+					body = `{"object":"list","data":[{"provider":"codex","user":"fresh@example.com","kind":"subscription","windows":[{"name":"5 hours","used":10,"remaining":90}]}]}`
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(body)),
+				}, nil
+			}),
+		}, nil
+	}
+
+	res, err := svc.TestUserMagpieSource(context.Background(), 1, true, TestMagpieSourceInput{
+		BaseURL:   "http://magpie:3425",
+		APIKey:    "mgp-key",
+		Providers: []string{"codex"},
+	})
+	require.NoError(t, err)
+	require.True(t, res.OK)
+	require.Equal(t, 1, res.MatchedCount)
+	require.Equal(t, []string{"/v1/magpie/quotas?kept=1", "/v1/magpie/quotas"}, requestedURLs)
 }
