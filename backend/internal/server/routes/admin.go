@@ -96,6 +96,9 @@ func RegisterAdminRoutes(
 		// 使用记录管理
 		registerUsageRoutes(admin, h)
 
+		// 用量 Hub（CLIProxyAPI 兼容，全站 Codex OAuth 额度总览）
+		registerUsageHubRoutes(admin, h, stepUpAuth)
+
 		// 用户属性管理
 		registerUserAttributeRoutes(admin, h)
 
@@ -719,6 +722,24 @@ func registerUsageRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		usage.GET("/cleanup-tasks", h.Admin.Usage.ListCleanupTasks)
 		usage.POST("/cleanup-tasks", h.Admin.Usage.CreateCleanupTask)
 		usage.POST("/cleanup-tasks/:id/cancel", h.Admin.Usage.CancelCleanupTask)
+	}
+}
+
+func registerUsageHubRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAuth middleware.StepUpAuthMiddleware) {
+	if h == nil || h.Admin == nil || h.Admin.UsageHub == nil {
+		return
+	}
+	hub := admin.Group("/usage-hub")
+	{
+		hub.GET("/config", h.Admin.UsageHub.GetConfig)
+		hub.PUT("/config", h.Admin.UsageHub.UpdateConfig)
+		// 轮换或删除对外管理密钥走 step-up 二次验证（未开启 2FA 时自动放行）
+		hub.POST("/key/regenerate", gin.HandlerFunc(stepUpAuth), h.Admin.UsageHub.RegenerateKey)
+		hub.DELETE("/key", gin.HandlerFunc(stepUpAuth), h.Admin.UsageHub.DeleteKey)
+		hub.GET("/accounts", h.Admin.UsageHub.ListAccounts)
+		hub.POST("/accounts/:id/refresh", h.Admin.UsageHub.RefreshAccount)
+		hub.POST("/accounts/refresh-all", h.Admin.UsageHub.RefreshAllAccounts)
+		hub.GET("/preview-auth-files", h.Admin.UsageHub.PreviewAuthFiles)
 	}
 }
 

@@ -995,6 +995,7 @@ var ProviderSet = wire.NewSet(
 	ProvideUserPlatformQuotaUsageFlusher,
 	NewUsageBillingLaneCombiner,
 	ProvideUsageBillingRepository,
+	NewUsageHubService,
 )
 
 // ProvideUsageBillingRepository 以按用户合并结算的通道作为各服务使用的计费仓储。

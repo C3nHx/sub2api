@@ -43,6 +43,7 @@ type AdminHandlers struct {
 	Affiliate              *admin.AffiliateHandler
 	Compliance             *admin.ComplianceHandler
 	AuditLog               *admin.AuditLogHandler
+	UsageHub               *admin.UsageHubHandler
 }
 
 // Handlers contains all HTTP handlers
@@ -52,6 +53,7 @@ type Handlers struct {
 	MCPOAuth         *MCPOAuthHandler
 	APIKey           *APIKeyHandler
 	Usage            *UsageHandler
+	UsageHub         *UsageHubHandler
 	Redeem           *RedeemHandler
 	Subscription     *SubscriptionHandler
 	Announcement     *AnnouncementHandler
